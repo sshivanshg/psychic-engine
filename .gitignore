@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.ruff_cache/
+.env
+
+# NOTE: uv.lock is intentionally NOT ignored — for an application you commit the
+# lockfile so every run resolves to the exact same dependency versions.

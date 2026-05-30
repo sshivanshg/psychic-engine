@@ -1,0 +1,25 @@
+# One command (`docker compose up -d`) gives you a Postgres database with the
+# TimescaleDB extension preinstalled. This is your whole data layer for Phase 0.
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16   # Postgres 16 + TimescaleDB, ready to go
+    container_name: tradeos-db
+    environment:
+      POSTGRES_USER: tradeos
+      POSTGRES_PASSWORD: tradeos
+      POSTGRES_DB: tradeos
+    ports:
+      - "5432:5432"            # exposed on localhost:5432 so your Python (and psql) can connect
+    volumes:
+      - tradeos-pgdata:/var/lib/postgresql/data   # named volume = your data survives restarts
+      # Scripts in this folder run ONCE, the first time the database initializes
+      # (i.e. when the volume is empty). This is how our table + hypertable get created.
+      - ./db/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tradeos -d tradeos"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  tradeos-pgdata:

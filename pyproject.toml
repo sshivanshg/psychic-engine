@@ -1,0 +1,30 @@
+[project]
+name = "tradeos"
+version = "0.1.0"
+description = "Personal portfolio intelligence — Phase 0: data foundation"
+requires-python = ">=3.12"
+dependencies = [
+    "psycopg[binary]>=3.2",   # PostgreSQL driver (v3). [binary] ships precompiled wheels.
+    "yfinance>=0.2.40",       # free daily OHLCV for NSE/BSE (uses the ".NS"/".BO" suffix)
+    "pandas>=2.2",            # yfinance returns DataFrames; we reshape them here
+    "python-dotenv>=1.0",     # load DATABASE_URL etc. from a .env file
+]
+
+[dependency-groups]
+dev = ["ruff>=0.6"]           # linter/formatter — run with `uv run ruff check .`
+
+# These let you run the pipeline as named commands: `uv run tradeos-ingest`
+[project.scripts]
+tradeos-ingest = "tradeos.ingest:ingest"
+tradeos-check = "tradeos.check:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tradeos"]
