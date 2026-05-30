@@ -35,23 +35,27 @@ analyze data you can't reliably store and query.
 tradeos/
 ├── docker-compose.yml      # brings up Postgres + TimescaleDB
 ├── db/init/01_init.sql     # runs ONCE on first DB boot: creates table + hypertable
-├── holdings.txt            # YOUR tickers, one per line  ← edit this
+├── holdings.csv            # YOUR portfolio: symbol,quantity,avg_cost  ← edit this
 ├── pyproject.toml          # deps + the `tradeos-ingest` / `tradeos-check` commands
 ├── .python-version         # pins Python 3.12 for uv
 ├── .env.example            # copy to .env only if you change DB creds
 └── src/tradeos/
-    ├── config.py           # env-driven settings + holdings loader
+    ├── config.py           # env-driven settings + portfolio loader
     ├── db.py               # one place that knows how to connect
     ├── ingest.py           # fetch OHLCV (yfinance) → UPSERT into Postgres
-    └── check.py            # prints row counts + date ranges (your "done" check)
+    ├── check.py            # prints row counts + date ranges (Phase 0 "done" check)
+    ├── risk.py             # Phase 1: portfolio risk math (pure Python, no LLM)
+    ├── risk_agent.py       # Phase 1: Claude turns the numbers into a plain-English read
+    └── cli.py              # Phase 1: `tradeos-risk` command
 ```
 
 ---
 
 ## Run it (5 steps)
 
-**1 — Put in your holdings.** Edit `holdings.txt`, one ticker per line. NSE = `.NS` suffix
-(e.g. `RELIANCE.NS`), BSE = `.BO`. (Examples are prefilled; swap in your real holdings.)
+**1 — Put in your holdings.** Edit `holdings.csv` — columns `symbol,quantity,avg_cost`. NSE =
+`.NS` suffix (e.g. `RELIANCE.NS`), BSE = `.BO`. (Examples are prefilled; swap in your real
+holdings. `avg_cost` is optional but unlocks unrealized-P&L in the risk report.)
 
 **2 — Start the database.**
 ```bash
@@ -120,7 +124,25 @@ docker compose down -v     # stops the DB and DELETES its data volume
 
 ---
 
-## What's next — Phase 1
-With reliable price data in your own DB, you build the **Risk Agent**: compute real portfolio
-risk (concentration, volatility, beta, drawdown) from this data, then add a thin LLM layer that
-*explains* it in plain English. See `ROADMAP.md` → Phase 1.
+## Phase 1 — the Risk Agent (built)
+
+With prices in your DB, compute and explain your portfolio's risk:
+
+```bash
+uv run tradeos-risk            # numbers + plain-English read (needs ANTHROPIC_API_KEY)
+uv run tradeos-risk --no-llm   # numbers only, no API key required
+uv run tradeos-risk --as-of 2025-06-30   # point-in-time (no look-ahead past that date)
+```
+
+**How it's split (the design that matters):**
+- `risk.py` — the **facts** layer. Pure Python/pandas: weights, concentration (HHI + effective
+  holdings), annualised volatility, beta vs NIFTY, max drawdown, % from 52-wk high, unrealized P&L.
+  Deterministic and testable — the LLM never computes a number.
+- `risk_agent.py` — the **narration** layer. Claude (`messages.parse` + a Pydantic schema) turns
+  those facts into a structured, plain-English risk read. It's *descriptive only* — it explains the
+  risk, it never tells you to buy/sell/hold. You make the call.
+- The `--as-of` flag is the seed of the **eval harness** (Phase 4): every query is filtered to
+  `date <= as_of`, so you can reconstruct past risk with no look-ahead.
+
+Set `ANTHROPIC_API_KEY` to enable the narration; `CLAUDE_MODEL` (default `claude-opus-4-8`) lets you
+switch to a cheaper model. See `ROADMAP.md` → Phase 2 for the multi-agent orchestration next.

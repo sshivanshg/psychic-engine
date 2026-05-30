@@ -1,31 +1,23 @@
--- Runs automatically the first time the DB container initializes (empty data volume).
--- If you change this file later, you must reset the volume to re-run it:
---   docker compose down -v && docker compose up -d
+-- TradeOS schema — plain PostgreSQL (runs on any Postgres 14+).
+-- Apply to a native local Postgres:  psql -d tradeos -f db/init/01_init.sql
+-- (Also auto-runs on first boot of the optional Docker DB in docker-compose.yml.)
+--
+-- Note: the original Phase 0 plan used a TimescaleDB *hypertable* to learn time-series
+-- storage. A stock Postgres install doesn't ship the timescaledb extension, so we use a
+-- plain table here — proper indexing covers our query patterns fine at this scale.
+-- Promoting `prices` to a hypertable becomes a deliberate Phase 6 ("earn the infra") task.
 
--- 1. Turn on TimescaleDB (the image has it installed; we just enable it in this DB).
-CREATE EXTENSION IF NOT EXISTS timescaledb;
-
--- 2. A plain relational table for daily price candles.
---    PRIMARY KEY (symbol, date) is what makes ingestion idempotent: re-ingesting the
---    same day for the same symbol updates the row instead of creating a duplicate.
---    NOTE: a hypertable's unique key MUST include the partitioning column (`date`).
 CREATE TABLE IF NOT EXISTS prices (
     symbol      text        NOT NULL,
     date        date        NOT NULL,
     open        double precision,
     high        double precision,
     low         double precision,
-    close       double precision,
+    close       double precision,   -- split-adjusted price (levels, value, technicals)
+    adj_close   double precision,   -- total-return (splits + dividends) → returns / risk
     volume      bigint,
     ingested_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (symbol, date)
+    PRIMARY KEY (symbol, date)   -- makes ingestion idempotent (UPSERT on conflict)
 );
 
--- 3. Promote it to a TimescaleDB hypertable, partitioned by time (`date`).
---    A hypertable looks/queries exactly like a normal table, but Timescale splits it
---    into time-based "chunks" under the hood — the thing you're here to learn.
---    (Modern equivalent: create_hypertable('prices', by_range('date'), ...);)
-SELECT create_hypertable('prices', 'date', if_not_exists => TRUE);
-
--- 4. A helper index for "give me one symbol's history, newest first" queries.
 CREATE INDEX IF NOT EXISTS idx_prices_symbol_date ON prices (symbol, date DESC);

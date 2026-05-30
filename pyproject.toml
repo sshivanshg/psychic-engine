@@ -7,16 +7,23 @@ dependencies = [
     "psycopg[binary]>=3.2",   # PostgreSQL driver (v3). [binary] ships precompiled wheels.
     "yfinance>=0.2.40",       # free daily OHLCV for NSE/BSE (uses the ".NS"/".BO" suffix)
     "pandas>=2.2",            # yfinance returns DataFrames; we reshape them here
+    "numpy>=1.26",            # risk math (volatility, beta, drawdown, concentration)
     "python-dotenv>=1.0",     # load DATABASE_URL etc. from a .env file
+    "anthropic>=0.50",        # Claude SDK — turns the risk numbers into a plain-English read
 ]
 
 [dependency-groups]
-dev = ["ruff>=0.6"]           # linter/formatter — run with `uv run ruff check .`
+dev = [
+    "ruff>=0.6",   # linter/formatter — `uv run ruff check .`
+    "pytest>=8",   # test runner — `uv run pytest`
+]
 
 # These let you run the pipeline as named commands: `uv run tradeos-ingest`
 [project.scripts]
 tradeos-ingest = "tradeos.ingest:ingest"
 tradeos-check = "tradeos.check:main"
+tradeos-risk = "tradeos.cli:main"
+tradeos-analyze = "tradeos.orchestrator:main"
 
 [tool.ruff]
 line-length = 100
