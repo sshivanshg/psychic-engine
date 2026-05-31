@@ -21,31 +21,37 @@ from concurrent.futures import ThreadPoolExecutor
 
 from pydantic import BaseModel
 
+from .agents import REGISTRY
 from .config import CLAUDE_MODEL
-from .risk import compute_risk
-from .technical import compute_all_technical
+from .context import AnalysisContext
+from .log import get_logger
+
+log = get_logger()
 
 
 # ----------------------------- structured synthesis output -----------------------------
 
 class StockCard(BaseModel):
     symbol: str
-    technical_read: str   # what the trend/momentum/level say
-    risk_read: str        # what this name contributes to portfolio risk
-    synthesis: str        # the two dimensions tied together (descriptive)
+    technical_read: str    # what the trend/momentum/level say
+    fundamental_read: str  # revenue/earnings growth, margins (or "no data")
+    risk_read: str         # what this name contributes to portfolio risk
+    synthesis: str         # the dimensions tied together (descriptive)
     watch_items: list[str]
 
 
 SYNTH_SYSTEM = """You are an equity analyst writing a one-card read on a single holding in someone's
-own portfolio. You are given precomputed TECHNICAL facts (trend/momentum/levels) and the stock's
-RISK facts (its contribution to portfolio risk, vol, beta). Synthesise them.
+own portfolio. You are given precomputed TECHNICAL facts (trend/momentum/levels), FUNDAMENTAL facts
+(revenue/earnings growth, margins), and the stock's RISK facts (contribution to portfolio risk, vol,
+beta). Synthesise them.
 
 Rules:
 - Describe and interpret the numbers; cite them. Do NOT give buy / sell / hold recommendations or
   price targets — explain the picture, the human decides.
-- Tie technical and risk together (e.g. "extended on momentum AND the book's largest risk
-  contributor" is a more important observation than either alone).
-- watch_items = concrete, factual things to keep an eye on (levels, momentum flips, risk concentration)."""
+- Tie the dimensions together (e.g. "growing fundamentals but technically extended AND the book's
+  largest risk contributor" is more useful than any one alone).
+- If a dimension has no data, say so briefly rather than inventing it.
+- watch_items = concrete, factual things to watch (levels, momentum flips, margin trend, risk concentration)."""
 
 
 def _narrate_card(client, card: dict) -> StockCard | None:
@@ -59,7 +65,8 @@ def _narrate_card(client, card: dict) -> StockCard | None:
             output_format=StockCard,
         )
         return resp.parsed_output
-    except Exception:  # noqa: BLE001 - one bad card shouldn't sink the whole run
+    except Exception as e:  # noqa: BLE001 - one bad card shouldn't sink the whole run
+        log.warning("synthesis failed for %s: %s", card.get("symbol"), e)
         return None
 
 
@@ -74,11 +81,12 @@ def _narrate_all(cards: list) -> dict:
     return {sym: rep for sym, rep in pairs if rep is not None}
 
 
-def _build_card(symbol: str, tech: dict, risk_pos: dict) -> dict:
+def _build_card(symbol: str, tech: dict, risk_pos: dict, fundamental: dict | None) -> dict:
     return {
         "symbol": symbol,
         "last_close": tech.get("last_close"),
         "technical": tech,
+        "fundamental": fundamental,
         "risk": {
             "weight_pct": risk_pos.get("weight_pct"),
             "risk_contribution_pct": risk_pos.get("risk_contribution_pct"),
@@ -90,11 +98,13 @@ def _build_card(symbol: str, tech: dict, risk_pos: dict) -> dict:
 
 
 def analyze(as_of=None, horizon: str = "annual", narrate: bool = True) -> dict:
-    risk = compute_risk(as_of=as_of, horizon=horizon)
-    tech = compute_all_technical(as_of)
+    # One shared context → agents run off a single data load, via the registry.
+    ctx = AnalysisContext.build(as_of=as_of, horizon=horizon)
+    results = {agent.name: agent.run(ctx) for agent in REGISTRY}
+    risk, tech, fund = results["risk"], results["technical"], results["fundamental"]
     risk_by_sym = {p["symbol"]: p for p in risk["positions"]}
 
-    cards = [_build_card(s, t, risk_by_sym.get(s, {})) for s, t in tech.items()]
+    cards = [_build_card(s, t, risk_by_sym.get(s, {}), fund.get(s)) for s, t in tech.items()]
     cards.sort(
         key=lambda c: (c["risk"].get("risk_contribution_pct") is not None,
                        c["risk"].get("risk_contribution_pct") or 0),
@@ -131,6 +141,12 @@ def _print(a: dict) -> None:
               f"  level={d['level']} ({_f(t['pct_from_52w_high'], '%')} from 52w high)")
         print(f"     price     : vs200SMA {_f(t['price_vs_sma200_pct'], '%')}  MACD-hist {_f(t['macd_hist'])}"
               f"  ret 1m {_f(t['ret_1m_pct'], '%')} / 3m {_f(t['ret_3m_pct'], '%')}  vol {_f(t['volume_trend'])}")
+        fn = c.get("fundamental")
+        if fn:
+            fd = fn["dials"]
+            print(f"     fundamental: revenue {_f(fd.get('revenue_growth'))} ({_f(fn['revenue_yoy_pct'], '%')} YoY)"
+                  f"  earnings {_f(fd.get('earnings_growth'))} ({_f(fn['net_income_yoy_pct'], '%')})"
+                  f"  margin {_f(fd.get('margin_trend'))} ({_f(fn['net_margin_pct'], '%')})")
         rep = a["narratives"].get(c["symbol"])
         if rep:
             print(f"     synthesis : {rep.synthesis}")
@@ -140,14 +156,19 @@ def _print(a: dict) -> None:
         print("\n  (Set ANTHROPIC_API_KEY for per-stock reasoning traces.)")
 
 
+def run(horizon: str = "annual", as_of=None, no_llm: bool = False) -> None:
+    _print(analyze(as_of=as_of, horizon=horizon, narrate=not no_llm))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Multi-agent portfolio analysis (risk + technical + synthesis).")
     ap.add_argument("--horizon", default="annual", help="risk horizon: d/w/m/q/y or N days")
     ap.add_argument("--as-of", help="point-in-time date YYYY-MM-DD")
     ap.add_argument("--no-llm", action="store_true", help="skip the Claude synthesis")
     args = ap.parse_args()
-    as_of = dt.date.fromisoformat(args.as_of) if args.as_of else None
-    _print(analyze(as_of=as_of, horizon=args.horizon, narrate=not args.no_llm))
+    run(horizon=args.horizon,
+        as_of=dt.date.fromisoformat(args.as_of) if args.as_of else None,
+        no_llm=args.no_llm)
 
 
 if __name__ == "__main__":

@@ -9,17 +9,22 @@ dependencies = [
     "pandas>=2.2",            # yfinance returns DataFrames; we reshape them here
     "numpy>=1.26",            # risk math (volatility, beta, drawdown, concentration)
     "python-dotenv>=1.0",     # load DATABASE_URL etc. from a .env file
-    "anthropic>=0.50",        # Claude SDK — turns the risk numbers into a plain-English read
+    "anthropic>=0.50",        # Claude SDK — narration + RAG answers
+    "pymupdf>=1.24",          # parse concall/results PDFs (import fitz)
+    "fastembed>=0.3",         # local ONNX embeddings (no API key) for RAG
+    "pgvector>=0.3",          # psycopg adapter for the vector column
 ]
 
 [dependency-groups]
 dev = [
     "ruff>=0.6",   # linter/formatter — `uv run ruff check .`
     "pytest>=8",   # test runner — `uv run pytest`
+    "mypy>=1.11",  # static type checker — `uv run mypy src/tradeos`
 ]
 
 # These let you run the pipeline as named commands: `uv run tradeos-ingest`
 [project.scripts]
+tradeos = "tradeos.main:main"                  # unified CLI: add / remove / holdings / ingest / risk / analyze
 tradeos-ingest = "tradeos.ingest:ingest"
 tradeos-check = "tradeos.check:main"
 tradeos-risk = "tradeos.cli:main"
@@ -28,6 +33,13 @@ tradeos-analyze = "tradeos.orchestrator:main"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true   # yfinance / fastembed / pgvector / fitz ship no stubs
+check_untyped_defs = true       # type-check function bodies even without full annotations
+warn_redundant_casts = true
+warn_unused_ignores = true
 
 [build-system]
 requires = ["hatchling"]

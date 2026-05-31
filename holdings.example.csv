@@ -1,0 +1,8 @@
+# Example portfolio — for reference only. Put YOUR real holdings in holdings.csv
+# (via `tradeos add SYMBOL QTY [AVG_COST]`, or by editing that file).
+symbol,quantity,avg_cost
+RELIANCE.NS,10,2400
+HDFCBANK.NS,15,1500
+INFY.NS,20,1300
+TCS.NS,5,3500
+ITC.NS,50,420

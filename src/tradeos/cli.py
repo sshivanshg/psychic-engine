@@ -89,6 +89,18 @@ def _print_report(rep) -> None:
     print(f"\n  {rep.reminder}")
 
 
+def run(horizon: str = "annual", as_of=None, no_llm: bool = False) -> None:
+    risk = compute_risk(as_of=as_of, horizon=horizon)
+    _print_numbers(risk)
+    if no_llm:
+        return
+    report = narrate_risk(risk)
+    if report is None:
+        print("\n(Set ANTHROPIC_API_KEY to get the plain-English desk read from Claude.)")
+    else:
+        _print_report(report)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Compute and explain portfolio risk (quant engine).")
     ap.add_argument("--horizon", default="annual",
@@ -96,18 +108,9 @@ def main() -> None:
     ap.add_argument("--as-of", help="point-in-time date YYYY-MM-DD (no look-ahead past it)")
     ap.add_argument("--no-llm", action="store_true", help="skip the Claude narration")
     args = ap.parse_args()
-
-    as_of = dt.date.fromisoformat(args.as_of) if args.as_of else None
-    risk = compute_risk(as_of=as_of, horizon=args.horizon)
-    _print_numbers(risk)
-
-    if args.no_llm:
-        return
-    report = narrate_risk(risk)
-    if report is None:
-        print("\n(Set ANTHROPIC_API_KEY to get the plain-English desk read from Claude.)")
-    else:
-        _print_report(report)
+    run(horizon=args.horizon,
+        as_of=dt.date.fromisoformat(args.as_of) if args.as_of else None,
+        no_llm=args.no_llm)
 
 
 if __name__ == "__main__":

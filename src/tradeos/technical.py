@@ -100,11 +100,17 @@ def compute_technical(close: pd.Series, volume: pd.Series) -> dict | None:
     }
 
 
-def compute_all_technical(as_of=None) -> dict:
-    """Per-symbol technical reads for every holding with enough history."""
-    symbols = [p.symbol for p in load_portfolio()]
+def compute_all_technical(as_of=None, *, panels=None, positions=None) -> dict:
+    """Per-symbol technical reads for every holding with enough history.
+    `panels`/`positions` can be injected (shared AnalysisContext) to avoid re-querying."""
+    if positions is None:
+        positions = load_portfolio()
+    symbols = [p.symbol for p in positions]
     # Technicals use the split-adjusted PRICE (chart levels), not the total-return series.
-    close, _adj, volume = _load_panels(symbols, as_of)
+    if panels is None:
+        close, _adj, volume = _load_panels(symbols, as_of)
+    else:
+        close, _adj, volume = panels
     if close.empty:
         return {}
     out = {}

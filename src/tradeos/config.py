@@ -43,6 +43,19 @@ RISK_LIMITS = {
     "max_days_to_liquidate": 5.0,       # any name taking > 5 days to exit is a liquidity risk
 }
 
+# Covariance shrinkage (Ledoit-Wolf toward a constant-correlation target). Default on; COV_SHRINKAGE=0 to disable.
+COV_SHRINKAGE = os.getenv("COV_SHRINKAGE", "1").lower() not in ("0", "false", "no")
+
+# Fundamentals are only *known* ~this many days after quarter-end (results announcement). Point-in-time
+# fundamental reads filter on period_end + this lag, so a back-test never sees results before they were public.
+ANNOUNCEMENT_LAG_DAYS = int(os.getenv("ANNOUNCEMENT_LAG_DAYS", "45"))
+
+# RAG (Phase 3): if even the closest retrieved chunk is farther than this cosine distance, `ask()`
+# flags the answer as weak/low-confidence instead of confidently answering over chunks that don't
+# cover the question (it never hides the evidence — only adds a caution). Calibrated for
+# bge-small-en-v1.5 (on-topic best hit ~0.30, off-topic best ~0.47); tune per corpus & embedding model.
+RAG_MAX_DISTANCE = float(os.getenv("RAG_MAX_DISTANCE", "0.45"))
+
 # Your portfolio: CSV with columns symbol,quantity,avg_cost ('#' lines are comments).
 PORTFOLIO_FILE = Path(os.getenv("PORTFOLIO_FILE", PROJECT_ROOT / "holdings.csv"))
 
@@ -93,3 +106,51 @@ def load_portfolio() -> list[Position]:
 def load_holdings() -> list[str]:
     """Just the ticker symbols (used by the ingester)."""
     return [p.symbol for p in load_portfolio()]
+
+
+PORTFOLIO_HEADER = "symbol,quantity,avg_cost"
+_PORTFOLIO_PREAMBLE = (
+    "# TradeOS — your portfolio. One row per holding.\n"
+    "#   columns: symbol,quantity,avg_cost   (avg_cost optional)\n"
+    "#   NSE = .NS suffix, BSE = .BO   (e.g. RELIANCE.NS)\n"
+    "#   manage with `tradeos add / remove / holdings`, or edit this file directly.\n"
+)
+
+
+def _fmt_num(x: float) -> str:
+    return str(int(x)) if float(x).is_integer() else str(x)
+
+
+def _safe_load() -> list[Position]:
+    """load_portfolio() but returns [] instead of raising on a missing/empty file."""
+    try:
+        return load_portfolio()
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+def save_portfolio(positions: list[Position]) -> None:
+    """Rewrite holdings.csv (preamble + header + one row per holding), sorted by symbol."""
+    lines = [_PORTFOLIO_PREAMBLE + PORTFOLIO_HEADER]
+    for p in sorted(positions, key=lambda x: x.symbol):
+        cost = "" if p.avg_cost is None else _fmt_num(p.avg_cost)
+        lines.append(f"{p.symbol},{_fmt_num(p.quantity)},{cost}")
+    PORTFOLIO_FILE.write_text("\n".join(lines) + "\n")
+
+
+def add_holding(symbol: str, quantity: float, avg_cost: float | None = None) -> list[Position]:
+    """Add or replace a holding and persist. Returns the updated portfolio (sorted)."""
+    symbol = symbol.strip().upper()
+    positions = [p for p in _safe_load() if p.symbol != symbol]
+    cost = float(avg_cost) if avg_cost is not None else None
+    positions.append(Position(symbol, float(quantity), cost))
+    save_portfolio(positions)
+    return sorted(positions, key=lambda p: p.symbol)
+
+
+def remove_holding(symbol: str) -> list[Position]:
+    """Remove a holding and persist. Returns the updated portfolio."""
+    symbol = symbol.strip().upper()
+    positions = [p for p in _safe_load() if p.symbol != symbol]
+    save_portfolio(positions)
+    return positions

@@ -1,14 +1,5 @@
 # TradeOS — your portfolio. One row per holding.
-#   columns: symbol,quantity,avg_cost
-#     symbol   — yfinance ticker. NSE = ".NS" suffix, BSE = ".BO" (e.g. RELIANCE.NS)
-#     quantity — units you hold
-#     avg_cost — your average buy price (optional; leave blank if unknown)
-#   '#' lines and blank lines are ignored.
-#
-# >>> Replace these examples with YOUR real holdings, then re-run: uv run tradeos-ingest
+#   columns: symbol,quantity,avg_cost   (avg_cost optional)
+#   NSE = .NS suffix, BSE = .BO   (e.g. RELIANCE.NS)
+#   manage with `tradeos add / remove / holdings`, or edit this file directly.
 symbol,quantity,avg_cost
-RELIANCE.NS,10,2400
-HDFCBANK.NS,15,1500
-INFY.NS,20,1300
-TCS.NS,5,3500
-ITC.NS,50,420

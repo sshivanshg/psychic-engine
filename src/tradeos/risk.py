@@ -17,11 +17,13 @@ Design choices a desk would recognise:
   * Tails via historical VaR & CVaR/Expected Shortfall (no Gaussian assumption).
   * Liquidity (days-to-liquidate), stress (worst historical windows), and limit breaches.
 
-NOTE (documented, intentional): vol is *conditional* (EWMA, current regime) while historical
-VaR is *unconditional* (full 2y empirical tail). They answer complementary questions; the
-consistent upgrade (Filtered Historical Simulation — scale historical returns by current/longrun
-vol) is a Phase-4 item. Covariance is unshrunk (Ledoit-Wolf is overkill at 5 names; revisit
-when the universe grows).
+NOTE (documented, intentional): we report tails BOTH ways. Plain historical VaR/CVaR is
+*unconditional* (the full 2y empirical tail), while Filtered Historical Simulation (`_fhs_var_cvar`,
+the `*_fhs_pct` fields) is *conditional* — it standardises returns by their EWMA vol and rescales to
+today's vol, so it tracks the current regime like the EWMA vol does. They answer complementary
+questions; both are surfaced. Covariance is EWMA, then shrunk toward a constant-correlation target
+with a Ledoit-Wolf intensity (`_ledoit_wolf_shrink`, on by default via COV_SHRINKAGE) — the shrinkage
+δ is small at 5 names but matters more as the universe grows, and is reported in `cov_shrinkage`.
 
 HORIZON: estimate once (daily), express at any horizon via σ_T = σ_daily·√T. Vol/VaR/CVaR scale;
 correlation, beta and risk-contribution % are horizon-INVARIANT. Limits stay pinned to natural
@@ -33,7 +35,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from .config import BENCHMARK, RISK_LIMITS, load_portfolio
+from .config import BENCHMARK, COV_SHRINKAGE, RISK_LIMITS, load_portfolio
 from .db import get_connection
 
 DAYS_PER_YEAR = 252
@@ -121,6 +123,54 @@ def _ewma_cov(returns: pd.DataFrame, lam: float = LAMBDA) -> pd.DataFrame:
     return pd.DataFrame(cov, index=r.columns, columns=r.columns)
 
 
+def _ewma_vol_series(returns: pd.Series, lam: float = LAMBDA) -> pd.Series:
+    return np.sqrt(returns.pow(2).ewm(alpha=1 - lam, adjust=False).mean())
+
+
+def _fhs_var_cvar(port_ret: pd.Series, conf: float, lam: float = LAMBDA):
+    """Filtered Historical Simulation VaR/CVaR — *conditional* (current-regime) tail.
+    Standardise returns by their EWMA vol, rescale to the latest vol, take the empirical quantile.
+    Unlike plain historical VaR (unconditional), this reflects today's volatility regime."""
+    r = port_ret.dropna()
+    if len(r) < 40:
+        return None, None
+    sigma = _ewma_vol_series(r, lam)
+    if sigma.iloc[-1] == 0:
+        return None, None
+    z = (r / sigma).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(z) < 40:
+        return None, None
+    return _var_cvar(z * float(sigma.iloc[-1]), conf)
+
+
+def _ledoit_wolf_shrink(cov: np.ndarray, returns: np.ndarray):
+    """Shrink a covariance toward the constant-correlation target with a Ledoit-Wolf intensity.
+    `returns` is the T×N matrix used to estimate the optimal intensity δ ∈ [0,1]. Reduces estimation
+    noise (most valuable as the universe grows). Conservative ρ term (diagonal only)."""
+    n = cov.shape[0]
+    if n < 2:
+        return cov, 0.0
+    d = np.sqrt(np.clip(np.diag(cov), 1e-18, None))
+    corr = cov / np.outer(d, d)
+    r_bar = (corr.sum() - n) / (n * (n - 1))           # mean off-diagonal correlation
+    target = r_bar * np.outer(d, d)
+    np.fill_diagonal(target, np.diag(cov))             # constant-correlation target keeps variances
+
+    gamma = float(np.sum((target - cov) ** 2))         # Frobenius distance to target
+    if gamma <= 0:
+        return cov, 0.0
+    x = returns - returns.mean(axis=0)
+    t = x.shape[0]
+    pi_mat = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            pi_mat[i, j] = np.mean((x[:, i] * x[:, j] - cov[i, j]) ** 2)
+    pi = float(pi_mat.sum())
+    rho = float(np.trace(pi_mat))                       # diagonal term (off-diag omitted → conservative)
+    delta = float(np.clip((pi - rho) / gamma / t, 0.0, 1.0))
+    return (1 - delta) * cov + delta * target, delta
+
+
 def _adjusted_beta(asset_ret: pd.Series, bench_ret: pd.Series):
     """Full-sample OLS beta with Bloomberg-style shrinkage toward the market beta of 1."""
     pair = pd.concat([asset_ret, bench_ret], axis=1).dropna()
@@ -149,16 +199,22 @@ def _worst_window(port_ret: pd.Series, n: int):
     return float(roll.min())
 
 
-def compute_risk(as_of=None, horizon: str = "annual") -> dict:
+def compute_risk(as_of=None, horizon: str = "annual", *, panels=None, positions=None) -> dict:
+    """Portfolio risk snapshot. `panels`/`positions` can be injected (shared AnalysisContext)
+    to avoid re-querying the DB; otherwise they're loaded here."""
     horizon_days, horizon_label = parse_horizon(horizon)
     hf = math.sqrt(horizon_days)
     af = math.sqrt(DAYS_PER_YEAR)
 
-    positions = load_portfolio()
+    if positions is None:
+        positions = load_portfolio()
     symbols = [p.symbol for p in positions]
-    close, adj, volume = _load_panels(symbols + [BENCHMARK], as_of)
+    if panels is None:
+        close, adj, volume = _load_panels(symbols + [BENCHMARK], as_of)
+    else:
+        close, adj, volume = panels
     if close.empty:
-        raise RuntimeError("No price data found. Run `uv run tradeos-ingest` first.")
+        raise RuntimeError("No price data found. Run `tradeos ingest` first.")
 
     have_bench = BENCHMARK in adj.columns
     log_ret = np.log(adj).diff()        # total-return → vol/covariance
@@ -185,9 +241,13 @@ def compute_risk(as_of=None, horizon: str = "annual") -> dict:
     betas: dict[str, float] = {}
     corr_matrix: dict[str, dict] = {}
     avg_pairwise = None
+    shrinkage_delta = 0.0
 
     if asset_syms:
         sig_d = cov_d.loc[asset_syms, asset_syms].values
+        if COV_SHRINKAGE and len(asset_syms) >= 2:
+            rmat = log_ret[asset_syms].dropna(how="any").to_numpy()
+            sig_d, shrinkage_delta = _ledoit_wolf_shrink(sig_d, rmat)
         pw = np.array([weights[s] for s in asset_syms])
 
         var_p_daily = float(pw @ sig_d @ pw)
@@ -222,6 +282,7 @@ def compute_risk(as_of=None, horizon: str = "annual") -> dict:
 
     # tails (1-day base) & stress (empirical) on current-weights P&L
     v95 = c95 = v99 = c99 = None
+    vf95 = vf99 = cf99 = None
     worst = {1: None, 5: None, 10: None, 21: None}
     if asset_syms:
         ps = simple_ret[asset_syms].dropna(how="any")
@@ -230,6 +291,8 @@ def compute_risk(as_of=None, horizon: str = "annual") -> dict:
             port_ret = pd.Series(ps.values @ pw, index=ps.index)
             v95, c95 = _var_cvar(port_ret, 0.95)
             v99, c99 = _var_cvar(port_ret, 0.99)
+            vf95, _ = _fhs_var_cvar(port_ret, 0.95)   # conditional (current-regime) VaR
+            vf99, cf99 = _fhs_var_cvar(port_ret, 0.99)
             worst = {n: _worst_window(port_ret, n) for n in (1, 5, 10, 21)}
 
     # liquidity (actual traded value = price × volume)
@@ -281,6 +344,10 @@ def compute_risk(as_of=None, horizon: str = "annual") -> dict:
         "var_99_pct": _round(_scale(v99, hf) * 100) if v99 is not None else None,
         "cvar_99_pct": _round(_scale(c99, hf) * 100) if c99 is not None else None,
         "var_99_1d_pct": _round(v99 * 100) if v99 is not None else None,
+        "var_95_fhs_pct": _round(_scale(vf95, hf) * 100) if vf95 is not None else None,
+        "var_99_fhs_pct": _round(_scale(vf99, hf) * 100) if vf99 is not None else None,
+        "cvar_99_fhs_pct": _round(_scale(cf99, hf) * 100) if cf99 is not None else None,
+        "cov_shrinkage": _round(shrinkage_delta, 3),
         "worst_1d_pct": _round(worst[1] * 100 if worst[1] is not None else None),
         "worst_5d_pct": _round(worst[5] * 100 if worst[5] is not None else None),
         "worst_10d_pct": _round(worst[10] * 100 if worst[10] is not None else None),
@@ -297,8 +364,8 @@ def compute_risk(as_of=None, horizon: str = "annual") -> dict:
         "horizon_days": horizon_days,
         "method": (
             "total-return prices for returns, split-adjusted for levels/value; "
-            "log-return EWMA(λ=0.94) covariance; adjusted full-sample beta (⅔·raw+⅓); "
-            f"historical VaR/CVaR; vol & VaR at {horizon_label} horizon (√time-scaled)"
+            "log-return EWMA(λ=0.94) covariance + Ledoit-Wolf shrinkage; adjusted full-sample beta "
+            f"(⅔·raw+⅓); historical + FHS-conditional VaR/CVaR; vol & VaR at {horizon_label} horizon"
         ),
         "portfolio": portfolio,
         "positions": positions_out,

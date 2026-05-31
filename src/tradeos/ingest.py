@@ -9,10 +9,13 @@ run it as often as you like (e.g. daily after market close).
 from collections.abc import Iterator
 
 import pandas as pd
-import yfinance as yf
 
 from .config import BENCHMARK, HISTORY_PERIOD, load_holdings
 from .db import get_connection
+from .log import get_logger
+from .sources import DEFAULT_SOURCE
+
+log = get_logger()
 
 # INSERT, but if (symbol, date) already exists, overwrite it instead of erroring.
 # This single statement is what makes the whole pipeline safe to re-run.
@@ -29,6 +32,40 @@ ON CONFLICT (symbol, date) DO UPDATE SET
     ingested_at = now();
 """
 
+FUND_UPSERT_SQL = """
+INSERT INTO fundamentals (symbol, period_end, total_revenue, operating_income, net_income, gross_profit)
+VALUES (%s, %s, %s, %s, %s, %s)
+ON CONFLICT (symbol, period_end) DO UPDATE SET
+    total_revenue    = EXCLUDED.total_revenue,
+    operating_income = EXCLUDED.operating_income,
+    net_income       = EXCLUDED.net_income,
+    gross_profit     = EXCLUDED.gross_profit,
+    ingested_at      = now();
+"""
+
+
+def fetch_fundamentals(ticker: str) -> list[tuple]:
+    """Quarterly income-statement rows from the price source. Best-effort: [] if unavailable."""
+    q = DEFAULT_SOURCE.quarterly_fundamentals(ticker)
+    if q is None or q.empty:
+        return []
+
+    def cell(row, col):
+        if row in q.index:
+            v = q.loc[row, col]
+            return float(v) if pd.notna(v) else None
+        return None
+
+    rows = []
+    for col in q.columns:
+        period_end = col.date() if hasattr(col, "date") else col
+        revenue = cell("Total Revenue", col)
+        if revenue is None:
+            continue  # skip quarters with no revenue
+        rows.append((ticker, period_end, revenue, cell("Operating Income", col),
+                     cell("Net Income", col), cell("Gross Profit", col)))
+    return rows
+
 
 def fetch_ohlcv(ticker: str, period: str) -> pd.DataFrame:
     """Fetch daily candles for one ticker as a clean lower-cased DataFrame.
@@ -38,13 +75,10 @@ def fetch_ohlcv(ticker: str, period: str) -> pd.DataFrame:
       - `adj_close` = total-return (Yahoo 'Adj Close': splits+div) → returns / risk.
     auto_adjust=False keeps them separate (auto_adjust=True would collapse close into adj_close).
     """
-    df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
+    df = DEFAULT_SOURCE.daily_ohlcv(ticker, period)
     if df.empty:
         return df
-
-    df = df.rename(columns=str.lower).rename(columns={"adj close": "adj_close"})
-    df = df[["open", "high", "low", "close", "adj_close", "volume"]].dropna()
-    # yfinance gives a (possibly tz-aware) DatetimeIndex; we only care about the date.
+    # source returns lower-cased OHLCV + adj_close; a (possibly tz-aware) DatetimeIndex → date.
     df.index = pd.to_datetime(df.index).date
     return df
 
@@ -64,28 +98,57 @@ def _rows(ticker: str, df: pd.DataFrame) -> Iterator[tuple]:
         )
 
 
-def ingest() -> None:
-    tickers = load_holdings()
-    # Always pull the benchmark too — the Risk Agent needs it to compute beta.
-    if BENCHMARK and BENCHMARK not in tickers:
-        tickers = tickers + [BENCHMARK]
+def ingest_symbols(tickers, *, with_benchmark: bool = False) -> int:
+    """Fetch + UPSERT the given tickers (deduped). Incremental: ingest just what you pass in."""
+    seen: list[str] = []
+    for t in tickers:
+        if t and t not in seen:
+            seen.append(t)
+    if with_benchmark and BENCHMARK and BENCHMARK not in seen:
+        seen.append(BENCHMARK)
+    if not seen:
+        print("Nothing to ingest.")
+        return 0
 
-    print(f"Ingesting {len(tickers)} ticker(s) (incl. benchmark {BENCHMARK}), period={HISTORY_PERIOD}\n")
-
+    print(f"Ingesting {len(seen)} ticker(s), period={HISTORY_PERIOD}\n")
     total = 0
     with get_connection() as conn, conn.cursor() as cur:
-        for ticker in tickers:
+        for ticker in seen:
             df = fetch_ohlcv(ticker, HISTORY_PERIOD)
             if df.empty:
                 print(f"  !  {ticker}: no data returned — check the symbol/suffix")
                 continue
-
             cur.executemany(UPSERT_SQL, list(_rows(ticker, df)))
             conn.commit()  # commit per ticker so partial runs still persist
             total += len(df)
-            print(f"  ✓  {ticker}: {len(df)} rows")
+            msg = f"  ✓  {ticker}: {len(df)} rows"
 
-    print(f"\nDone. {total} rows upserted. Verify with:  uv run tradeos-check")
+            if ticker != BENCHMARK:  # the index has no fundamentals
+                try:
+                    frows = fetch_fundamentals(ticker)
+                    if frows:
+                        cur.executemany(FUND_UPSERT_SQL, frows)
+                        conn.commit()
+                        msg += f"  + {len(frows)} quarterly fundamentals"
+                except Exception as e:  # noqa: BLE001 - fundamentals are best-effort
+                    log.warning("fundamentals fetch failed for %s: %s", ticker, e)
+                    msg += f"  (fundamentals skipped: {str(e)[:40]})"
+            print(msg)
+
+    print(f"\nDone. {total} price rows upserted.")
+    return total
+
+
+def ingest() -> None:
+    """Refresh price data for the whole portfolio (+ benchmark)."""
+    try:
+        holdings = load_holdings()
+    except (FileNotFoundError, ValueError):
+        holdings = []
+    if not holdings:
+        print("No holdings yet. Add some:  tradeos add SYMBOL QTY [AVG_COST]")
+        return
+    ingest_symbols(holdings, with_benchmark=True)
 
 
 if __name__ == "__main__":

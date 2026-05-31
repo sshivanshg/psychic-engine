@@ -4,6 +4,8 @@ __pycache__/
 *.egg-info/
 .ruff_cache/
 .env
+holdings.csv          # your real portfolio — keep private; holdings.example.csv is the template
+data/                 # your concall/results PDFs for RAG — keep private
 
 # NOTE: uv.lock is intentionally NOT ignored — for an application you commit the
 # lockfile so every run resolves to the exact same dependency versions.
