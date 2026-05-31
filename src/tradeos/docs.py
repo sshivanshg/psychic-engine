@@ -263,7 +263,7 @@ def coverage_status(symbols=None) -> list[dict]:
     with get_connection() as c, c.cursor() as cur:
         cur.execute(f"SELECT symbol, max(period_end) FROM fundamentals WHERE symbol IN ({ph}) "
                     f"GROUP BY symbol", list(symbols))
-        expected = dict(cur.fetchall())
+        expected: dict[str, object] = dict(cur.fetchall())
         cur.execute(f"SELECT symbol, count(*), count(DISTINCT source), max(period), max(ingested_at) "
                     f"FROM doc_chunks WHERE symbol IN ({ph}) GROUP BY symbol", list(symbols))
         docs = {r[0]: {"chunks": r[1], "docs": r[2], "latest_period": r[3], "last_ingested": r[4]}
