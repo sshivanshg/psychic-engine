@@ -13,6 +13,8 @@ dependencies = [
     "pymupdf>=1.24",          # parse concall/results PDFs (import fitz)
     "fastembed>=0.3",         # local ONNX embeddings (no API key) for RAG
     "pgvector>=0.3",          # psycopg adapter for the vector column
+    "fastapi>=0.136",         # Phase 5: JSON API over the engine (dashboard backend)
+    "uvicorn[standard]>=0.48",  # ASGI server for the FastAPI app
 ]
 
 [dependency-groups]
@@ -24,11 +26,12 @@ dev = [
 
 # These let you run the pipeline as named commands: `uv run tradeos-ingest`
 [project.scripts]
-tradeos = "tradeos.main:main"                  # unified CLI: add / remove / holdings / ingest / risk / analyze
+tradeos = "tradeos.main:main"                  # unified CLI: add/remove/holdings/ingest/risk/analyze/briefing/serve
 tradeos-ingest = "tradeos.ingest:ingest"
 tradeos-check = "tradeos.check:main"
 tradeos-risk = "tradeos.cli:main"
 tradeos-analyze = "tradeos.orchestrator:main"
+tradeos-api = "tradeos.api:serve"              # Phase 5: FastAPI dashboard backend
 
 [tool.ruff]
 line-length = 100

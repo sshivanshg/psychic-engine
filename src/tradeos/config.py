@@ -46,9 +46,19 @@ RISK_LIMITS = {
 # Covariance shrinkage (Ledoit-Wolf toward a constant-correlation target). Default on; COV_SHRINKAGE=0 to disable.
 COV_SHRINKAGE = os.getenv("COV_SHRINKAGE", "1").lower() not in ("0", "false", "no")
 
+# Macro agent: flag a single sector exceeding this % of the book (concentration). Also the
+# denominator for the macro sub-score in the attention score.
+SECTOR_CONCENTRATION_PCT = float(os.getenv("SECTOR_CONCENTRATION_PCT", "40.0"))
+
 # Fundamentals are only *known* ~this many days after quarter-end (results announcement). Point-in-time
 # fundamental reads filter on period_end + this lag, so a back-test never sees results before they were public.
 ANNOUNCEMENT_LAG_DAYS = int(os.getenv("ANNOUNCEMENT_LAG_DAYS", "45"))
+
+# Transaction cost per leg, in basis points — used to NET the eval's long-short tercile spread. A
+# long-short tercile rebalanced each horizon pays ~4 legs/cycle (enter+exit on both the long and the
+# short book). Indian cash-equity all-in (brokerage + STT + impact) is ~10-25 bps/side for liquid
+# large-caps; 15 is a reasonable default. Set higher for less-liquid names.
+COST_BPS = float(os.getenv("COST_BPS", "15"))
 
 # RAG (Phase 3): if even the closest retrieved chunk is farther than this cosine distance, `ask()`
 # flags the answer as weak/low-confidence instead of confidently answering over chunks that don't
@@ -58,6 +68,12 @@ RAG_MAX_DISTANCE = float(os.getenv("RAG_MAX_DISTANCE", "0.45"))
 
 # Your portfolio: CSV with columns symbol,quantity,avg_cost ('#' lines are comments).
 PORTFOLIO_FILE = Path(os.getenv("PORTFOLIO_FILE", PROJECT_ROOT / "holdings.csv"))
+
+# Back-test UNIVERSE: optional file of extra tickers (one symbol per line, '#' comments) that should
+# be in the eval cross-section but aren't current holdings — e.g. names you've SOLD or that DELISTED.
+# Including them is how you fight survivorship bias (Prime Directive #3): the eval universe =
+# current holdings ∪ this file. It does NOT affect risk/analyze (those run on holdings.csv only).
+UNIVERSE_FILE = Path(os.getenv("UNIVERSE_FILE", PROJECT_ROOT / "universe.csv"))
 
 
 @dataclass(frozen=True)
@@ -106,6 +122,33 @@ def load_portfolio() -> list[Position]:
 def load_holdings() -> list[str]:
     """Just the ticker symbols (used by the ingester)."""
     return [p.symbol for p in load_portfolio()]
+
+
+def _read_symbol_file(path: Path) -> list[str]:
+    """Read a plain symbol-per-line file (ignoring '#' comments / blanks / an optional `symbol` header)."""
+    if not path.exists():
+        return []
+    out: list[str] = []
+    for raw in path.read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.lower() == "symbol":
+            continue
+        out.append(line.split(",", 1)[0].strip().upper())
+    return out
+
+
+def load_universe() -> list[str]:
+    """The back-test universe = current holdings ∪ UNIVERSE_FILE (sold/delisted names), deduped.
+
+    Survivorship fix (Directive #3): the eval cross-section should include names that have LEFT the
+    book, not just survivors. Returns holdings when no universe file exists, so it degrades to the
+    old behaviour — but now the bias is the user's *declared* omissions, not a hard-coded limitation.
+    """
+    seen: dict[str, None] = {}
+    for s in [*load_holdings(), *_read_symbol_file(UNIVERSE_FILE)]:
+        if s:
+            seen.setdefault(s, None)
+    return list(seen)
 
 
 PORTFOLIO_HEADER = "symbol,quantity,avg_cost"

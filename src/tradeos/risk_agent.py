@@ -13,6 +13,7 @@ import os
 from pydantic import BaseModel
 
 from .config import CLAUDE_MODEL
+from .trace import RunTrace, timed_call
 
 
 class PositionNote(BaseModel):
@@ -54,27 +55,34 @@ Hard rules:
 - End with a one-line reminder that this is descriptive risk analysis, not investment advice."""
 
 
-def narrate_risk(risk: dict) -> RiskReport | None:
+def narrate_risk(risk: dict, trace: RunTrace | None = None) -> RiskReport | None:
     """Return a structured buy-side risk read, or None if no API key is set."""
     if not os.getenv("ANTHROPIC_API_KEY"):
         return None
 
     import anthropic  # lazy import so the numbers-only path needs no SDK/key
 
+    own = trace is None          # standalone call owns + prints its own trace; composed callers pass one in
+    trace = trace or RunTrace()
     client = anthropic.Anthropic()
-    response = client.messages.parse(
-        model=CLAUDE_MODEL,
-        max_tokens=2500,
-        # cache_control marks the system prompt cacheable; only actually caches once the prefix
-        # exceeds the model minimum (~4096 tokens on Opus), harmless below that.
-        system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        messages=[{
-            "role": "user",
-            "content": (
-                "Here are the precomputed risk metrics for my portfolio as JSON. "
-                "Give me the desk risk read.\n\n" + json.dumps(risk, indent=2)
-            ),
-        }],
-        output_format=RiskReport,
+    response = timed_call(
+        trace, "risk", CLAUDE_MODEL,
+        lambda: client.messages.parse(
+            model=CLAUDE_MODEL,
+            max_tokens=2500,
+            # cache_control marks the system prompt cacheable; only actually caches once the prefix
+            # exceeds the model minimum (~4096 tokens on Opus), harmless below that.
+            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Here are the precomputed risk metrics for my portfolio as JSON. "
+                    "Give me the desk risk read.\n\n" + json.dumps(risk, indent=2)
+                ),
+            }],
+            output_format=RiskReport,
+        ),
     )
+    if own:
+        trace.print_summary()
     return response.parsed_output

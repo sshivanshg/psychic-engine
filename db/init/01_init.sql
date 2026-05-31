@@ -36,6 +36,16 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     PRIMARY KEY (symbol, period_end)
 );
 
+-- Per-security metadata (sector/industry/name) for the Macro agent's sector-exposure read.
+-- yfinance .info is best-effort; columns stay nullable so a missing sector degrades gracefully.
+CREATE TABLE IF NOT EXISTS security_meta (
+    symbol      text PRIMARY KEY,
+    sector      text,
+    industry    text,
+    name        text,
+    ingested_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- Phase 3b: RAG over concall/results documents. Needs the pgvector extension.
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS doc_chunks (
@@ -53,9 +63,60 @@ CREATE TABLE IF NOT EXISTS doc_chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_doc_chunks_hnsw ON doc_chunks USING hnsw (embedding vector_cosine_ops);
 
+-- Phase 3: structured guidance extracted from a holding's concall (schema-constrained, with the
+-- verbatim source quotes). The Fundamental agent reads this so the (costly) LLM extraction is paid
+-- once, not on every analyze. `data` holds the GuidanceExtract fields as JSON.
+CREATE TABLE IF NOT EXISTS guidance (
+    symbol       text  NOT NULL,
+    source       text  NOT NULL,   -- the document the guidance was extracted from
+    period       date,             -- quarter the guidance pertains to (the doc's period)
+    data         jsonb NOT NULL,   -- revenue_outlook / margin_outlook / demand_commentary / quotes …
+    extracted_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (symbol, source)
+);
+
 -- Backfill the provenance columns on databases created before they existed (idempotent). Provenance
 -- is what lets `tradeos docs status` tell whether a holding's latest reported quarter has a
 -- transcript, and lets the eval harness reason about point-in-time availability.
 ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS period      date;
 ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS filing_date date;
 ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS source_url  text;
+
+-- Per-article news sentiment for the Sentiment agent. Stored per-article (not aggregated) so a
+-- point-in-time read can filter on `published`. CAVEAT: free news feeds give only a CURRENT snapshot
+-- with shallow history, so sentiment is descriptive-of-now and is deliberately BARRED from the eval
+-- harness (it is not reconstructable point-in-time). polarity ∈ [-1, 1] from a transparent lexicon.
+CREATE TABLE IF NOT EXISTS sentiment (
+    symbol      text        NOT NULL,
+    title       text        NOT NULL,
+    publisher   text,
+    published   timestamptz,                 -- article time, if the source provides it
+    polarity    double precision NOT NULL,   -- lexicon score in [-1, 1]
+    ingested_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (symbol, title)
+);
+CREATE INDEX IF NOT EXISTS idx_sentiment_symbol ON sentiment (symbol, published DESC);
+
+-- Per-holding ownership snapshot for the Ownership agent (institutional / insider holding). yfinance
+-- exposes only a CURRENT snapshot (no history), so like sentiment this is descriptive-of-now and is
+-- BARRED from the eval harness. Nullable so a missing field degrades to "no data".
+CREATE TABLE IF NOT EXISTS ownership (
+    symbol                text PRIMARY KEY,
+    held_pct_institutions double precision,   -- fraction (0-1) held by institutions
+    held_pct_insiders     double precision,   -- fraction (0-1) held by insiders/promoters (proxy)
+    n_institutions        integer,
+    snapshot_at           timestamptz,        -- when the snapshot was taken (the only "as-of" we have)
+    ingested_at           timestamptz NOT NULL DEFAULT now()
+);
+
+-- Run snapshots for the "what-changed" delta: each `analyze` persists a compact per-stock payload so
+-- the next run can diff dials / score / risk against the prior run. `as_of` is the analysis date;
+-- `run_at` is wall-clock so we can always find the immediately-prior run.
+CREATE TABLE IF NOT EXISTS run_snapshots (
+    id      bigserial PRIMARY KEY,
+    symbol  text        NOT NULL,
+    as_of   date,
+    run_at  timestamptz NOT NULL DEFAULT now(),
+    payload jsonb       NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_snapshots_symbol_runat ON run_snapshots (symbol, run_at DESC);

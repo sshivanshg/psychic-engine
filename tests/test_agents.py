@@ -8,7 +8,7 @@ from tradeos.context import AnalysisContext
 
 def test_registry_shape():
     names = [a.name for a in REGISTRY]
-    assert names == ["risk", "technical", "fundamental"]
+    assert names == ["risk", "technical", "fundamental", "macro", "sentiment", "ownership"]
     assert all(a.scope in ("portfolio", "per_stock") for a in REGISTRY)
 
 
@@ -21,6 +21,7 @@ def test_agents_run_via_shared_context():
     assert "positions" in out["risk"] and "portfolio" in out["risk"]
     assert isinstance(out["technical"], dict)
     assert isinstance(out["fundamental"], dict)
+    assert "by_symbol" in out["macro"] and "portfolio" in out["macro"]
 
 
 def test_injected_panels_match_self_loaded():

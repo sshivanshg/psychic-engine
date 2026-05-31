@@ -6,7 +6,26 @@ import math
 import pandas as pd
 import pytest
 
-from tradeos.fundamental import _bucket_growth, _pct, _year_ago, compute_all_fundamental
+from tradeos.config import ANNOUNCEMENT_LAG_DAYS
+from tradeos.fundamental import (
+    _availability_cutoff,
+    _bucket_growth,
+    _pct,
+    _year_ago,
+    compute_all_fundamental,
+    load_fundamentals,
+)
+
+
+def test_availability_cutoff_applies_announcement_lag():
+    # Point-in-time read: a quarter is only visible once results were public (period_end + lag).
+    # So the query cutoff must be as_of - lag, and None (no filter) when as_of is None.
+    assert _availability_cutoff(None) is None
+    as_of = dt.date(2026, 5, 31)
+    assert _availability_cutoff(as_of) == as_of - dt.timedelta(days=ANNOUNCEMENT_LAG_DAYS)
+    # accepts an ISO string and a datetime, not just a date
+    assert _availability_cutoff("2026-05-31") == as_of - dt.timedelta(days=ANNOUNCEMENT_LAG_DAYS)
+    assert _availability_cutoff(dt.datetime(2026, 5, 31, 9, 30)) == as_of - dt.timedelta(days=ANNOUNCEMENT_LAG_DAYS)
 
 
 def test_pct():
@@ -44,3 +63,25 @@ def test_compute_all_fundamental_shape():
     for _sym, f in out.items():  # empty is fine (data may not be ingested); shape if present
         assert {"revenue_growth", "earnings_growth", "margin_trend"} <= set(f["dials"])
         assert "revenue_yoy_pct" in f and "net_margin_pct" in f
+
+
+def test_load_fundamentals_respects_announcement_lag():
+    """Invariant (Prime Directive #2): a quarter must NOT be visible until period_end + lag <= as_of,
+    and must reappear once enough time has passed. Locks the look-ahead fix at the query level."""
+    try:
+        full = load_fundamentals(["INFY.NS"])           # as_of=None ⇒ no filter (all quarters)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"DB not available: {e}")
+    df = full.get("INFY.NS")
+    if df is None or df.empty:
+        pytest.skip("no INFY.NS fundamentals ingested")
+    latest_pe = df.iloc[0]["period_end"]                # df is period_end DESC
+
+    # 10 days after quarter-end — inside the announcement lag — the quarter is not yet public.
+    early = load_fundamentals(["INFY.NS"], as_of=latest_pe + dt.timedelta(days=10))
+    early_df = early.get("INFY.NS")
+    assert early_df is None or latest_pe not in list(early_df["period_end"])
+
+    # Well past the lag, it is public again.
+    late = load_fundamentals(["INFY.NS"], as_of=latest_pe + dt.timedelta(days=ANNOUNCEMENT_LAG_DAYS + 5))
+    assert "INFY.NS" in late and latest_pe in list(late["INFY.NS"]["period_end"])

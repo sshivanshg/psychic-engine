@@ -26,14 +26,20 @@ What we measure, for each price signal, over a point-in-time history:
 Honesty caveats baked in:
 - **No look-ahead:** signals use only trailing data; the forward return is the (future) label.
   `as_of` hard-stops the price panel so a replay never sees beyond the simulated date.
+- **Fundamental signals are point-in-time.** They are read at their AVAILABILITY date
+  (`period_end + config.ANNOUNCEMENT_LAG_DAYS`), so a quarter only enters the cross-section once its
+  results were public — never on period-end. (Prime Directive #2.)
+- **Costs are reported.** Each signal shows the gross long-short tercile spread AND a net spread
+  after `config.COST_BPS` of round-trip transaction cost (~4 legs/cycle for a rebalanced long-short).
+  Directive #4: net is shown, not just a gross upper bound.
+- **Survivorship is flagged, not hidden.** The universe is your CURRENT holdings, so sold/delisted
+  names are absent — an upward bias the result dict and the printout both call out (Directive #3).
+  A delisted-inclusive universe needs a point-in-time constituents feed; that's the next data lift.
+- **Multiple testing.** Several signals are scored; no deflation/Bonferroni is applied, so the
+  result reports `n_signals` and the printout warns that a lone |t|>2 across many trials is suspect.
 - **Small universe ⇒ illustrative, not conclusive.** A 5-name cross-section is dominated by one or
   two names; the cross-sectional IC is honest but underpowered. `n_dates`, `universe` and the
-  Newey-West t-stat are printed so you can judge the power yourself — and the t-stat will usually,
-  correctly, say "not significant" on a handful of large-caps.
-- **Gross of costs.** No transaction costs or turnover are modelled — the tercile spread is an
-  upper bound a real book would never capture. Turnover/cost-aware net returns are a TODO.
-- **Price-based signals only.** Fundamental signals must apply the results-announcement lag
-  (`config.ANNOUNCEMENT_LAG_DAYS`) before they can be evaluated here — a TODO for that extension.
+  Newey-West t-stat are printed so you can judge the power yourself.
 """
 
 import math
@@ -41,7 +47,8 @@ import math
 import numpy as np
 import pandas as pd
 
-from .config import load_holdings
+from .config import ANNOUNCEMENT_LAG_DAYS, COST_BPS, UNIVERSE_FILE, load_universe
+from .fundamental import load_fundamentals
 from .risk import _load_panels
 
 MIN_HISTORY = 250        # a name needs ~1y of daily obs to contribute a meaningful signal
@@ -63,6 +70,70 @@ SIGNALS = {
     "rsi_14": lambda s: _rsi_series(s),                            # mean-reversion: expect NEGATIVE IC
     "low_volatility": lambda s: -s.pct_change().rolling(63).std(),  # low-vol anomaly
 }
+
+# Fundamental signals are quarterly facts; each is read at its AVAILABILITY date, never period-end.
+FUND_SIGNALS = ("net_margin", "earnings_yoy", "revenue_yoy")
+FUND_NW_LAG = 1          # fundamental ICs are thinned to ~non-overlapping windows ⇒ low residual autocorr
+
+
+def _fundamental_feature(df: pd.DataFrame, which: str,
+                         lag_days: int = ANNOUNCEMENT_LAG_DAYS) -> pd.Series:
+    """One quarterly fundamental feature as a Series indexed by its AVAILABILITY date.
+
+    Availability = `period_end + lag_days` (results-announcement lag): the first day the number was
+    public. YoY uses a 4-quarter shift (approximate — yfinance quarters can have gaps); margin is a
+    level. Returned point-in-time so the eval can align it to prices with no look-ahead.
+    """
+    d = df.dropna(subset=["period_end"]).sort_values("period_end")
+    if d.empty:
+        return pd.Series(dtype=float)
+    avail = pd.DatetimeIndex(pd.to_datetime(d["period_end"]) + pd.Timedelta(days=lag_days))
+    rev = d["total_revenue"].astype(float)
+    ni = d["net_income"].astype(float)
+    if which == "net_margin":
+        val = ni / rev * 100
+    elif which == "revenue_yoy":
+        val = (rev / rev.shift(4) - 1) * 100
+    elif which == "earnings_yoy":
+        val = (ni / ni.shift(4) - 1) * 100
+    else:
+        raise ValueError(f"unknown fundamental signal {which!r}")
+    out = pd.Series(val.to_numpy(dtype=float), index=avail)
+    return out.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def _fundamental_panels(adj: pd.DataFrame, fundamentals: dict, symbols, which: str, horizon: int):
+    """Aligned (signal, forward-return) panels [date x symbol] for one fundamental signal.
+
+    The quarterly feature is forward-filled onto trading dates by AVAILABILITY (a value applies from
+    the day it goes public until the next quarter is announced) — a proper point-in-time as-of join.
+    """
+    sig_cols, fwd_cols = {}, {}
+    for sym in symbols:
+        if sym not in adj.columns:
+            continue
+        s = adj[sym].dropna()
+        if len(s) < MIN_HISTORY:
+            continue
+        df = fundamentals.get(sym)
+        if df is None or len(df) < 2:
+            continue
+        feat = _fundamental_feature(df, which)
+        if feat.empty:
+            continue
+        sidx = pd.DatetimeIndex(pd.to_datetime(list(s.index)))
+        aligned = feat.sort_index().reindex(feat.index.union(sidx)).ffill().reindex(sidx)
+        sig_cols[sym] = pd.Series(aligned.to_numpy(dtype=float), index=s.index)
+        fwd_cols[sym] = s.shift(-horizon) / s - 1
+    if not sig_cols:
+        return pd.DataFrame(), pd.DataFrame()
+    return pd.DataFrame(sig_cols), pd.DataFrame(fwd_cols)
+
+
+def _net_spread(gross, cost_bps: float):
+    """Net the gross long-short tercile spread for transaction cost. A long-short tercile rebalanced
+    each horizon pays ~4 legs/cycle (enter+exit on both the long and the short book)."""
+    return None if gross is None else gross - 4 * cost_bps / 1e4
 
 
 def _spearman(x: pd.Series, y: pd.Series):
@@ -174,49 +245,84 @@ def _round(x, n=3):
     return round(float(x), n) if x is not None and not (isinstance(x, float) and math.isnan(x)) else None
 
 
-def evaluate(horizon: int = 21, step: int = 5, as_of=None) -> dict:
-    symbols = load_holdings()
+def _score(sig: pd.DataFrame, fwd: pd.DataFrame, step: int, nw_lag: int,
+           kind: str, cost_bps: float) -> dict:
+    """Turn one aligned (signal, forward-return) pair into the full metric row."""
+    ic_series = _cross_sectional_ic(sig, fwd)
+    n_dates = len(ic_series)
+    mean_ic = t_stat = icir = None
+    if n_dates >= 8:
+        mean_ic, t_stat = _newey_west_tstat(ic_series, nw_lag)
+        sd = float(ic_series.std(ddof=1))
+        icir = (mean_ic / sd) if (mean_ic is not None and sd > 0) else None
+
+    hit, base, n_obs = _hit_and_base(sig, fwd, step)
+    spread = _tercile_spread(sig, fwd)
+    net = _net_spread(spread, cost_bps)
+    pooled, _ = _pooled_ic(sig, fwd, step)
+
+    return {
+        "kind": kind,
+        "n_dates": n_dates,
+        "n_obs": n_obs,
+        "ic": _round(mean_ic),
+        "icir": _round(icir, 2),
+        "t_stat": _round(t_stat, 2),
+        "hit_rate_pct": _round(hit, 1),
+        "base_rate_pct": _round(base, 1),
+        "ls_spread_pct": _round(spread * 100, 2) if spread is not None else None,
+        "ls_spread_net_pct": _round(net * 100, 2) if net is not None else None,
+        "pooled_ic": _round(pooled),
+    }
+
+
+def evaluate(horizon: int = 21, step: int = 5, as_of=None, cost_bps: float | None = None) -> dict:
+    cost_bps = COST_BPS if cost_bps is None else cost_bps
+    symbols = load_universe()          # holdings ∪ sold/delisted names → fights survivorship bias
     _close, adj, _vol = _load_panels(symbols, as_of)
     if adj.empty:
         raise RuntimeError("No price data. Run `tradeos ingest` first.")
 
     nw_lag = max(1, horizon - 1)         # overlapping h-day windows ⇒ autocorrelation up to ~h lags
     universe = sorted(s for s in symbols if s in adj.columns)
+    # Full fundamental history (as_of=None): the announcement-lag is applied in the as-of alignment
+    # below, so a future quarter simply never reaches a price date inside the (as_of-bounded) panel.
+    fundamentals = load_fundamentals(universe)
 
-    results = {}
+    results: dict = {}
     for name, fn in SIGNALS.items():
         sig, fwd = _signal_panels(adj, universe, fn, horizon)
+        if not sig.empty:
+            results[name] = _score(sig, fwd, step, nw_lag, "price", cost_bps)
+    for name in FUND_SIGNALS:
+        sig, fwd = _fundamental_panels(adj, fundamentals, universe, name, horizon)
         if sig.empty:
             continue
-
-        ic_series = _cross_sectional_ic(sig, fwd)
-        n_dates = len(ic_series)
-        mean_ic = t_stat = icir = None
-        if n_dates >= 8:
-            mean_ic, t_stat = _newey_west_tstat(ic_series, nw_lag)
-            sd = float(ic_series.std(ddof=1))
-            icir = (mean_ic / sd) if (mean_ic is not None and sd > 0) else None
-
-        hit, base, n_obs = _hit_and_base(sig, fwd, step)
-        spread = _tercile_spread(sig, fwd)
-        pooled, _ = _pooled_ic(sig, fwd, step)
-
-        results[name] = {
-            "n_dates": n_dates,
-            "n_obs": n_obs,
-            "ic": _round(mean_ic),
-            "icir": _round(icir, 2),
-            "t_stat": _round(t_stat, 2),
-            "hit_rate_pct": _round(hit, 1),
-            "base_rate_pct": _round(base, 1),
-            "ls_spread_pct": _round(spread * 100, 2) if spread is not None else None,
-            "pooled_ic": _round(pooled),
-        }
+        # A fundamental level is near-constant between quarterly announcements, so DAILY overlapping
+        # cross-sectional ICs hugely overstate the independent sample (and thus significance — a
+        # near-static 5-name ranking would read |t|>2 spuriously). Thin to ~non-overlapping
+        # horizon-spaced dates, so the t-stat reflects the true (small) number of independent windows.
+        sig, fwd = sig.iloc[::horizon], fwd.iloc[::horizon]
+        if not sig.empty:
+            results[name] = _score(sig, fwd, step, FUND_NW_LAG, "fundamental", cost_bps)
 
     return {
         "horizon_days": horizon,
         "step_days": step,
         "universe": len(universe),
         "nw_lag": nw_lag,
+        "lag_days": ANNOUNCEMENT_LAG_DAYS,
+        "cost_bps": cost_bps,
+        "n_signals": len(results),
+        "survivorship": _survivorship_note(),
         "signals": results,
     }
+
+
+def _survivorship_note() -> str:
+    """Describe the universe honestly: whether a sold/delisted-name file is in use (Directive #3)."""
+    if UNIVERSE_FILE.exists():
+        return ("universe = holdings ∪ declared sold/delisted names (universe.csv) — survivorship is "
+                "reduced to whatever names you omit")
+    return ("universe = current holdings only (no universe.csv) — survivorship-biased; add sold/"
+            "delisted names to universe.csv to fix")

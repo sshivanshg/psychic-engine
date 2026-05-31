@@ -6,15 +6,34 @@ INFY). Ratios are currency-invariant, so per-ticker growth/margin signals stay v
 
 Descriptive only: "revenue growing 12% YoY, margins expanding" — never "buy".
 
-CAVEAT (for the Phase-4 eval harness): point-in-time here is approximate — quarters are filtered by
-`period_end`, but the numbers were only *known* ~30-45 days later (results announcement). That
-announcement lag is a look-ahead to handle properly when we back-test fundamental signals.
+POINT-IN-TIME (Prime Directive #2): a quarter's numbers are only *known* ~ANNOUNCEMENT_LAG_DAYS after
+period-end (results announcement). So a point-in-time read for `as_of` requires the AVAILABILITY date,
+not the period-end: `period_end + lag <= as_of`, i.e. `period_end <= as_of - lag`. `_availability_cutoff`
+applies that. With `as_of=None` (live) there's no filter — yfinance only ever returns already-announced
+quarters, so live mode is safe; the lag matters on the historical replay / back-test path.
 """
+
+import datetime as dt
 
 import pandas as pd
 
-from .config import load_portfolio
+from .config import ANNOUNCEMENT_LAG_DAYS, load_portfolio
 from .db import get_connection
+
+
+def _availability_cutoff(as_of):
+    """Latest `period_end` whose results were *public* by `as_of` (apply the announcement lag).
+
+    Returns `as_of - ANNOUNCEMENT_LAG_DAYS` as a date, or None when `as_of` is None (no filter)."""
+    if as_of is None:
+        return None
+    if isinstance(as_of, dt.datetime):
+        d = as_of.date()
+    elif isinstance(as_of, dt.date):
+        d = as_of
+    else:
+        d = dt.date.fromisoformat(str(as_of)[:10])
+    return d - dt.timedelta(days=ANNOUNCEMENT_LAG_DAYS)
 
 
 def _pct(new, old):
@@ -37,9 +56,10 @@ def _load(symbol, as_of=None) -> pd.DataFrame:
     sql = ("SELECT period_end, total_revenue, operating_income, net_income, gross_profit "
            "FROM fundamentals WHERE symbol = %s")
     params: list = [symbol]
-    if as_of is not None:
+    cutoff = _availability_cutoff(as_of)          # period_end + announcement-lag <= as_of
+    if cutoff is not None:
         sql += " AND period_end <= %s"
-        params.append(as_of)
+        params.append(cutoff)
     sql += " ORDER BY period_end DESC"
     with get_connection() as c, c.cursor() as cur:
         cur.execute(sql, params)
@@ -67,9 +87,10 @@ def load_fundamentals(symbols, as_of=None) -> dict:
     sql = ("SELECT symbol, period_end, total_revenue, operating_income, net_income, gross_profit "
            f"FROM fundamentals WHERE symbol IN ({placeholders})")
     params: list = list(symbols)
-    if as_of is not None:
+    cutoff = _availability_cutoff(as_of)          # period_end + announcement-lag <= as_of
+    if cutoff is not None:
         sql += " AND period_end <= %s"
-        params.append(as_of)
+        params.append(cutoff)
     sql += " ORDER BY symbol, period_end DESC"
     with get_connection() as c, c.cursor() as cur:
         cur.execute(sql, params)
@@ -118,17 +139,35 @@ def compute_fundamental(symbol, as_of=None) -> dict | None:
     return _compute_from_df(_load(symbol, as_of))
 
 
-def compute_all_fundamental(as_of=None, *, fundamentals=None, positions=None) -> dict:
-    """Per-symbol fundamental reads for every holding that has quarterly data ingested.
-    `fundamentals`/`positions` can be injected (shared AnalysisContext) to avoid re-querying."""
+def _empty_fundamental() -> dict:
+    """Full-shape, all-None fundamental dict — used when a holding has guidance but no quarterly numbers."""
+    return {"latest_quarter": None, "revenue_yoy_pct": None, "revenue_qoq_pct": None,
+            "net_income_yoy_pct": None, "net_margin_pct": None, "op_margin_pct": None,
+            "net_margin_change_pp": None,
+            "dials": {"revenue_growth": None, "earnings_growth": None, "margin_trend": None}}
+
+
+def compute_all_fundamental(as_of=None, *, fundamentals=None, positions=None, guidance=None) -> dict:
+    """Per-symbol fundamental reads: yfinance quarterly RATIOS + (Phase 3) extracted concall GUIDANCE.
+    `fundamentals`/`positions`/`guidance` can be injected (shared AnalysisContext) to avoid re-querying."""
     if positions is None:
         positions = load_portfolio()
     symbols = [p.symbol for p in positions]
     if fundamentals is None:
         fundamentals = load_fundamentals(symbols, as_of)
+    if guidance is None:
+        from .extraction import load_all_guidance
+        guidance = load_all_guidance(symbols, as_of)   # point-in-time: only docs public by as_of
+
     out = {}
     for sym in symbols:
         f = _compute_from_df(fundamentals.get(sym))
-        if f:
-            out[sym] = f
+        g = guidance.get(sym)
+        if f is None and g is None:
+            continue
+        if f is None:                      # guidance present but no quarterly numbers yet
+            f = _empty_fundamental()
+        if g:
+            f["guidance"] = g
+        out[sym] = f
     return out

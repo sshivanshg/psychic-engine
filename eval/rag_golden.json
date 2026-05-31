@@ -1,0 +1,27 @@
+[
+  {
+    "symbol": "INFY.NS",
+    "question": "What was the operating margin this quarter and what is the target margin band?",
+    "must_contain": ["21.1%", "20% to 22%"]
+  },
+  {
+    "symbol": "INFY.NS",
+    "question": "What is the FY27 revenue growth guidance?",
+    "must_contain": ["2% to 4%"]
+  },
+  {
+    "symbol": "INFY.NS",
+    "question": "How did voluntary attrition change year on year?",
+    "must_contain": ["13.4%"]
+  },
+  {
+    "symbol": "INFY.NS",
+    "question": "What final dividend did the Board recommend?",
+    "must_contain": ["22 per share"]
+  },
+  {
+    "symbol": "INFY.NS",
+    "question": "How is generative AI affecting the deal pipeline?",
+    "must_contain": ["deflationary", "positive"]
+  }
+]

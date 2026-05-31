@@ -1,0 +1,8 @@
+# TradeOS — back-test universe (survivorship fix, Prime Directive #3).
+# One ticker per line. These are added to the eval cross-section ON TOP OF your current holdings —
+# put names here that you've SOLD or that DELISTED, so the back-test isn't biased toward survivors.
+# Copy to universe.csv (gitignored) and add your own. Does NOT affect `risk` / `analyze`.
+#
+# symbol
+YESBANK.NS
+PNB.NS

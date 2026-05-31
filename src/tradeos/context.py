@@ -11,8 +11,12 @@ from dataclasses import dataclass
 import pandas as pd
 
 from .config import BENCHMARK, Position, load_portfolio
+from .extraction import load_all_guidance
 from .fundamental import load_fundamentals
+from .macro import load_sectors
+from .ownership import load_ownership
 from .risk import _load_panels
+from .sentiment import load_sentiment
 
 
 @dataclass
@@ -24,6 +28,10 @@ class AnalysisContext:
     adj: pd.DataFrame          # total-return (returns/vol/VaR/beta)
     volume: pd.DataFrame
     fundamentals: dict         # {symbol: quarterly DataFrame}
+    sectors: dict              # {symbol: sector} for the macro agent
+    guidance: dict             # {symbol: extracted concall guidance} for the fundamental agent
+    sentiment: dict            # {symbol: [news articles]} for the sentiment agent
+    ownership: dict            # {symbol: ownership snapshot} for the ownership agent
 
     @property
     def panels(self) -> tuple:
@@ -39,4 +47,9 @@ class AnalysisContext:
         symbols = [p.symbol for p in positions]
         close, adj, volume = _load_panels(symbols + [BENCHMARK], as_of)
         fundamentals = load_fundamentals(symbols, as_of)
-        return cls(as_of, horizon, positions, close, adj, volume, fundamentals)
+        sectors = load_sectors(symbols)
+        guidance = load_all_guidance(symbols, as_of)   # point-in-time: only docs public by as_of
+        sentiment = load_sentiment(symbols, as_of)     # current snapshot (eval-barred), as_of-filtered if dated
+        ownership = load_ownership(symbols)            # current snapshot only (no history)
+        return cls(as_of, horizon, positions, close, adj, volume, fundamentals, sectors, guidance,
+                   sentiment, ownership)

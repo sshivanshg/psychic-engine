@@ -140,6 +140,25 @@ def _cmd_ask(args):
         print(f"  [{i}] {h['source']}#{h['chunk']}  d={h['distance']}  {snippet}…")
 
 
+def _cmd_extract(args):
+    from .extraction import extract_guidance
+    res = extract_guidance(args.symbol)
+    if res.get("stored"):
+        g = res["guidance"]
+        print(f"\n✓ extracted guidance for {args.symbol.upper()} from {res['source']}:")
+        for key in ("revenue_outlook", "margin_outlook", "demand_commentary"):
+            if g.get(key):
+                print(f"  {key.replace('_', ' ')}: {g[key]}")
+        for o in g.get("other_guidance", []):
+            print(f"  • {o}")
+        print(f"  ({len(g.get('quotes', []))} supporting quote(s) stored — read on every `tradeos analyze`)")
+        return
+    print(f"\n{res.get('note', '')}")
+    for i, h in enumerate(res.get("hits", []), 1):
+        snip = " ".join(h["content"][:120].split())
+        print(f"  [{i}] {h['source']}#{h['chunk']}  d={h['distance']}  {snip}…")
+
+
 def _cmd_eval(args):
     from .eval import evaluate
     r = evaluate(horizon=args.horizon, step=args.step)
@@ -147,20 +166,49 @@ def _cmd_eval(args):
           f"pooled sampled every {r['step_days']}d")
     print("  IC = cross-sectional rank IC (per-date Spearman across names, averaged); "
           "t = Newey-West (overlap-adjusted)")
-    print("=" * 88)
-    hdr = (f"  {'signal':<16}{'dates':>6}{'IC':>7}{'ICIR':>7}{'t':>7}"
-           f"{'hit%':>7}{'base%':>7}{'LS%':>8}{'poolIC':>8}")
+    print("=" * 96)
+    hdr = (f"  {'signal':<16}{'kind':<6}{'dates':>6}{'IC':>7}{'ICIR':>6}{'t':>6}"
+           f"{'hit%':>6}{'base%':>7}{'LS%':>7}{'LSnet%':>8}{'poolIC':>8}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for name, s in r["signals"].items():
-        print(f"  {name:<16}{s['n_dates']:>6}{_f(s['ic']):>7}{_f(s['icir']):>7}{_f(s['t_stat']):>7}"
-              f"{_f(s['hit_rate_pct']):>7}{_f(s['base_rate_pct']):>7}"
-              f"{_f(s['ls_spread_pct']):>8}{_f(s['pooled_ic']):>8}")
+        print(f"  {name:<16}{s.get('kind', '—'):<6}{s['n_dates']:>6}{_f(s['ic']):>7}{_f(s['icir']):>6}"
+              f"{_f(s['t_stat']):>6}{_f(s['hit_rate_pct']):>6}{_f(s['base_rate_pct']):>7}"
+              f"{_f(s['ls_spread_pct']):>7}{_f(s['ls_spread_net_pct']):>8}{_f(s['pooled_ic']):>8}")
     print(f"\n  Read it: |t| ≳ 2 ≈ significant (Newey-West lag {r['nw_lag']}d). hit% vs a 50% null; "
-          f"base% = P(fwd>0). LS% = top−bottom tercile, gross of cost.")
-    print("  Small universe ⇒ illustrative, not conclusive: a 5-name cross-section is underpowered, "
-          "so t will usually read 'noise'.")
-    print("  poolIC mixes time + cross-section (inflated n) — diagnostic only, never the headline.")
+          f"base% = P(fwd>0).")
+    print(f"  LS% = top−bottom tercile (gross); LSnet% nets ~4×{r['cost_bps']:.0f}bps round-trip cost/cycle.")
+    print(f"  Fundamental signals are point-in-time: read at period_end + {r['lag_days']}d "
+          f"(results-announcement availability) — no look-ahead.")
+    print(f"  ⚠ Survivorship: {r['survivorship']}.")
+    print(f"  ⚠ Multiple testing: {r['n_signals']} signals scored; no deflation applied — "
+          f"a lone |t|>2 across many trials is suspect.")
+    print("  Small universe ⇒ illustrative, not conclusive. poolIC mixes time + cross-section "
+          "(inflated n) — diagnostic only, never the headline.")
+
+
+def _cmd_rag_eval(args):
+    from .rag_eval import evaluate_rag
+    r = evaluate_rag(k=args.k)
+    s = r["summary"]
+    print(f"\nRAG eval — {s['questions']} golden question(s) · top-{s['k']} retrieval")
+    print("  retrieval (offline): recall = expected facts present in retrieved chunks; "
+          "answerable = all present")
+    print("=" * 84)
+    hdr = f"  {'symbol':<11}{'recall':>7}{'answerable':>12}{'bestDist':>10}  question"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for row in r["rows"]:
+        ans = "yes" if row.get("answerable") else "no" if row.get("answerable") is not None else "—"
+        gen = (f"  [grounded={row.get('grounded')} answer_hit={row.get('answer_hit')}]"
+               if s["generation_evaluated"] else "")
+        print(f"  {row['symbol']:<11}{_f(row.get('recall')):>7}{ans:>12}{_f(row.get('best_distance')):>10}"
+              f"  {row['question'][:38]}{gen}")
+    print(f"\n  mean recall {_f(s['mean_recall'])} · answerable rate {_f(s['answerable_rate'])} · "
+          f"mean best-distance {_f(s['mean_best_distance'])}")
+    if not s["generation_evaluated"]:
+        print("  (generation faithfulness skipped — set ANTHROPIC_API_KEY to also score the answers.)")
+    print("  Tiny corpus ⇒ illustrative; recall@k earns its meaning once real multi-doc filings are ingested.")
 
 
 def _as_of(args):
@@ -174,7 +222,19 @@ def _cmd_risk(args):
 
 def _cmd_analyze(args):
     from .orchestrator import run
-    run(horizon=args.horizon, as_of=_as_of(args), no_llm=args.no_llm)
+    run(horizon=args.horizon, as_of=_as_of(args), no_llm=args.no_llm,
+        no_snapshot=getattr(args, "no_snapshot", False))
+
+
+def _cmd_briefing(args):
+    from .briefing import print_briefing, run_briefing
+    print_briefing(run_briefing(as_of=_as_of(args), horizon=args.horizon))
+
+
+def _cmd_serve(args):
+    from .api import serve
+    print(f"TradeOS API → http://{args.host}:{args.port}  (interactive docs at /docs)")
+    serve(host=args.host, port=args.port)
 
 
 def main() -> None:
@@ -217,10 +277,18 @@ def main() -> None:
     ak.add_argument("question")
     ak.set_defaults(func=_cmd_ask)
 
+    ex = sub.add_parser("extract", help="extract structured concall guidance (RAG → fundamental agent)")
+    ex.add_argument("symbol")
+    ex.set_defaults(func=_cmd_extract)
+
     ev = sub.add_parser("eval", help="back-test whether signals predict forward returns")
     ev.add_argument("--horizon", type=int, default=21, help="forward-return horizon in trading days")
     ev.add_argument("--step", type=int, default=5, help="subsample dates every N days (limit overlap)")
     ev.set_defaults(func=_cmd_eval)
+
+    re_ = sub.add_parser("rag-eval", help="evaluate RAG retrieval (+ generation if a key is set) vs a golden set")
+    re_.add_argument("--k", type=int, default=3, help="top-k chunks to retrieve per question")
+    re_.set_defaults(func=_cmd_rag_eval)
 
     for name, fn, desc in (("risk", _cmd_risk, "portfolio risk read"),
                            ("analyze", _cmd_analyze, "multi-agent per-stock analysis")):
@@ -228,7 +296,20 @@ def main() -> None:
         p.add_argument("--horizon", default="annual", help="d/w/m/q/y or N days")
         p.add_argument("--as-of", help="point-in-time date YYYY-MM-DD")
         p.add_argument("--no-llm", action="store_true", help="skip the Claude layer")
+        if name == "analyze":
+            p.add_argument("--no-snapshot", action="store_true",
+                           help="don't store/diff a run snapshot (the what-changed delta)")
         p.set_defaults(func=fn)
+
+    bf = sub.add_parser("briefing", help="pre-market briefing: overview + alerts on your rules")
+    bf.add_argument("--horizon", default="annual", help="d/w/m/q/y or N days")
+    bf.add_argument("--as-of", help="point-in-time date YYYY-MM-DD")
+    bf.set_defaults(func=_cmd_briefing)
+
+    sv = sub.add_parser("serve", help="run the FastAPI server (dashboard backend)")
+    sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--port", type=int, default=8000)
+    sv.set_defaults(func=_cmd_serve)
 
     args = ap.parse_args()
     try:

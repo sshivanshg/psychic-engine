@@ -100,6 +100,37 @@ def compute_technical(close: pd.Series, volume: pd.Series) -> dict | None:
     }
 
 
+def price_series(symbol: str, as_of=None, *, lookback: int = 400) -> dict | None:
+    """Point-in-time price history + SMA overlays for charting one holding.
+
+    Returns the last `lookback` sessions of split-adjusted close, SMA 20/50/200 (computed on the FULL
+    history so the long averages are populated), and volume. `as_of` bounds the panel (no look-ahead).
+    None when the symbol has no data. This is a read for the dashboard — the quant core is untouched.
+    """
+    close, _adj, volume = _load_panels([symbol], as_of)
+    if close.empty or symbol not in close.columns:
+        return None
+    full = close[symbol].dropna()
+    if full.empty:
+        return None
+    sma = {n: full.rolling(n).mean() for n in (20, 50, 200)}
+    idx = full.tail(lookback).index
+    vol = volume[symbol] if symbol in volume.columns else pd.Series(dtype=float)
+
+    def at(series: pd.Series) -> list:
+        return [None if pd.isna(v) else round(float(v), 2) for v in series.reindex(idx).values]
+
+    return {
+        "symbol": symbol,
+        "dates": [str(d) for d in idx],
+        "close": at(full),
+        "sma20": at(sma[20]),
+        "sma50": at(sma[50]),
+        "sma200": at(sma[200]),
+        "volume": [None if pd.isna(v) else int(v) for v in vol.reindex(idx).values],
+    }
+
+
 def compute_all_technical(as_of=None, *, panels=None, positions=None) -> dict:
     """Per-symbol technical reads for every holding with enough history.
     `panels`/`positions` can be injected (shared AnalysisContext) to avoid re-querying."""
