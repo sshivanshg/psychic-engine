@@ -12,6 +12,7 @@ from tradeos.fundamental import (
     _bucket_growth,
     _pct,
     _year_ago,
+    calendar_yoy_pct,
     compute_all_fundamental,
     load_fundamentals,
 )
@@ -33,6 +34,34 @@ def test_pct():
     assert math.isclose(_pct(90, 100), -10, rel_tol=1e-9)
     assert _pct(None, 100) is None
     assert _pct(100, 0) is None        # guard against divide-by-zero
+    # a NEGATIVE base (loss-making prior year) makes a growth % meaningless — and would invert sign.
+    assert _pct(50, -100) is None      # loss→profit turnaround must NOT read as a decline
+    assert _pct(-200, -100) is None    # loss→bigger-loss off a negative base ⇒ undefined, not +100%
+    # a negative `new` over a POSITIVE base is a real, correctly-signed decline and is kept.
+    assert math.isclose(_pct(-50, 100), -150, rel_tol=1e-9)   # profit→loss = −150% (truly declining)
+
+
+def test_calendar_yoy_pct_matches_agent_and_is_gap_robust():
+    # 2024-09 missing on purpose. shift(4) would mis-pair 2025-03 with 2024-06 (a 9-month "YoY");
+    # the calendar matcher pairs 2025-03 with 2024-03 (true YoY) or yields NaN when no match exists.
+    pe = [dt.date(2024, 3, 31), dt.date(2024, 6, 30), dt.date(2024, 12, 31), dt.date(2025, 3, 31)]
+    rev = [100.0, 110.0, 130.0, 150.0]
+    yoy = calendar_yoy_pct(pe, rev)
+    assert math.isnan(yoy.iloc[0]) and math.isnan(yoy.iloc[1])    # no year-ago row yet
+    assert math.isnan(yoy.iloc[2])                                # 2024-12 has no 2023-12 base
+    assert math.isclose(yoy.iloc[3], 50.0, rel_tol=1e-9)          # 2025-03 vs 2024-03 = +50%
+    # the SHARED definition: eval's calendar_yoy_pct equals the agent's _year_ago + _pct, last quarter
+    df = pd.DataFrame({"period_end": list(reversed(pe)), "total_revenue": list(reversed(rev))})
+    agent_yoy = _pct(df.iloc[0]["total_revenue"], _year_ago(df, df.iloc[0])["total_revenue"])
+    assert math.isclose(yoy.iloc[-1], agent_yoy, rel_tol=1e-9)
+
+
+def test_calendar_yoy_pct_guards_negative_base():
+    # prior-year earnings were a LOSS: a YoY % off that base is undefined (NaN), never a sign-flip.
+    pe = [dt.date(2024, 3, 31), dt.date(2025, 3, 31)]
+    ni = [-100.0, 50.0]                                            # loss → profit (a turnaround)
+    yoy = calendar_yoy_pct(pe, ni)
+    assert math.isnan(yoy.iloc[1])                                # not −150% / "declining"
 
 
 def test_bucket_growth():

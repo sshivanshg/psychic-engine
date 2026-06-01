@@ -120,3 +120,23 @@ CREATE TABLE IF NOT EXISTS run_snapshots (
     payload jsonb       NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_run_snapshots_symbol_runat ON run_snapshots (symbol, run_at DESC);
+
+-- Price revision log (bitemporal) — an APPEND-ONLY archive of price values as they were OBSERVED on
+-- each ingest day. yfinance retroactively re-adjusts the whole history on every split/dividend, and
+-- the `prices` UPSERT overwrites with the latest adjustment — so a back-test isn't reproducible across
+-- re-ingests (the same `as_of` can return different numbers later). This table logs each (symbol,date)
+-- value the first time it's seen, and again only when the vendor RESTATES it, stamped with the ingest
+-- day (`vintage_date`). An `as_of` replay reconstructs the panel as-known-at a date by taking, per
+-- (symbol,date), the latest `vintage_date` <= that date (see risk.load_panels_asof). Reproducibility,
+-- per the project bar that every number be traceable to its inputs and `as_of`. CAVEAT: past vintages
+-- cannot be backfilled — the archive only covers ingests from when this table exists onward.
+CREATE TABLE IF NOT EXISTS price_vintages (
+    symbol       text NOT NULL,
+    date         date NOT NULL,          -- trading day the values are for (valid time)
+    vintage_date date NOT NULL,          -- ingest day we observed them (transaction time)
+    close        double precision,
+    adj_close    double precision,
+    volume       bigint,
+    PRIMARY KEY (symbol, date, vintage_date)
+);
+CREATE INDEX IF NOT EXISTS idx_price_vintages_lookup ON price_vintages (symbol, date, vintage_date DESC);

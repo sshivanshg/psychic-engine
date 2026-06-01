@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
   import { num } from '$lib/format';
+  import { theme } from '$lib/theme';
   import Chart from '$lib/Chart.svelte';
   import { icBarOption } from '$lib/charts';
 
@@ -42,7 +43,7 @@
 
   <div class="panel">
     <div class="panel-h"><h2>Information coefficient by signal</h2><span class="hint">amber = |t| ≥ 2 (significant) · blue = noise</span></div>
-    <Chart option={icBarOption(data.signals)} height="260px" />
+    {#key $theme}<Chart option={icBarOption(data.signals)} height="260px" />{/key}
   </div>
 
   <div class="panel">

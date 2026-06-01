@@ -3,6 +3,15 @@
 # put names here that you've SOLD or that DELISTED, so the back-test isn't biased toward survivors.
 # Copy to universe.csv (gitignored) and add your own. Does NOT affect `risk` / `analyze`.
 #
+# IMPORTANT: the point is names that LEFT a book — delisted / acquired / merged / suspended (and
+# names you personally sold). Listing names that still trade adds survivors, not a survivorship fix.
+# yfinance coverage for delisted Indian names is patchy: after adding a name, run `tradeos ingest`
+# and confirm it returned price rows (a "no data" line means yfinance has nothing — drop it).
+#
+# Examples of the RIGHT KIND (delisted/acquired — verify each still pulls data before relying on it):
+#   DHFL.NS          # delisted 2021 after insolvency
+#   RELCAPITAL.NS    # Reliance Capital — resolution / delisting
+#   CADILAHC.NS      # renamed (Zydus) — old ticker
+#   VEDL.NS          # Vedanta delisting attempts (still listed as of writing — check)
+#
 # symbol
-YESBANK.NS
-PNB.NS

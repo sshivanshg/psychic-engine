@@ -4,6 +4,15 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>TradeOS</title>
+    <script>
+      // Apply the saved theme before first paint so there's no flash of the wrong palette.
+      try {
+        var t = localStorage.getItem('tradeos-theme');
+        document.documentElement.dataset.theme = t === 'light' || t === 'black' ? t : 'black';
+      } catch (e) {
+        document.documentElement.dataset.theme = 'black';
+      }
+    </script>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">

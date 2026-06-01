@@ -31,6 +31,7 @@ EMBED_DIM = 384
 
 log = get_logger()
 _embedder = None
+_client = None
 
 
 def _model():
@@ -39,6 +40,15 @@ def _model():
         from fastembed import TextEmbedding
         _embedder = TextEmbedding(model_name=EMBED_MODEL)
     return _embedder
+
+
+def _get_client():
+    """Lazily build and reuse one Anthropic client across `ask()` calls."""
+    global _client
+    if _client is None:
+        import anthropic
+        _client = anthropic.Anthropic()
+    return _client
 
 
 def _as_vec(v) -> np.ndarray:
@@ -62,13 +72,6 @@ def embed_query(text: str) -> np.ndarray:
     query_embed is the correct seam: swap in an asymmetric retrieval model later and the query gets
     its instruction prefix for free, with no call-site change."""
     return _as_vec(next(iter(_model().query_embed([text]))))
-
-
-def _conn():
-    conn = get_connection()
-    from pgvector.psycopg import register_vector
-    register_vector(conn)
-    return conn
 
 
 def parse_document(path) -> str:
@@ -130,7 +133,7 @@ def add_document(symbol: str, path, *, period=None, filing_date=None, source_url
     vectors = embed(chunks)
     rows = [(symbol, source, i, c, v, period, filing_date, source_url)
             for i, (c, v) in enumerate(zip(chunks, vectors))]
-    with _conn() as conn, conn.cursor() as cur:
+    with get_connection() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM doc_chunks WHERE symbol=%s AND source=%s", (symbol, source))
         cur.executemany(
             "INSERT INTO doc_chunks "
@@ -145,7 +148,7 @@ def add_document(symbol: str, path, *, period=None, filing_date=None, source_url
 def search(symbol: str, query: str, k: int = 5) -> list[dict]:
     """Cosine-nearest chunks for a query (pgvector `<=>` = cosine distance; smaller = closer)."""
     qv = embed_query(query)
-    with _conn() as conn, conn.cursor() as cur:
+    with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT content, source, chunk_index, embedding <=> %s AS dist "
             "FROM doc_chunks WHERE symbol=%s ORDER BY dist LIMIT %s",
@@ -200,7 +203,6 @@ def ask(symbol: str, question: str, k: int = 5, max_distance: float | None = Non
     if not os.getenv("ANTHROPIC_API_KEY"):
         return {"answer": None, "citations": [], "hits": hits, "weak_evidence": weak, "note": note}
 
-    import anthropic
     from pydantic import BaseModel
 
     class CitedAnswer(BaseModel):
@@ -209,7 +211,7 @@ def ask(symbol: str, question: str, k: int = 5, max_distance: float | None = Non
 
     context = "\n\n".join(f"[{i + 1}] (source: {h['source']})\n{h['content']}" for i, h in enumerate(hits))
     try:
-        msg = anthropic.Anthropic().messages.parse(
+        msg = _get_client().messages.parse(
             model=CLAUDE_MODEL,
             max_tokens=900,
             system=[{"type": "text", "text": _ASK_SYSTEM, "cache_control": {"type": "ephemeral"}}],

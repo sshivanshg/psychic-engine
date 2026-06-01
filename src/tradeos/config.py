@@ -145,7 +145,10 @@ def load_universe() -> list[str]:
     old behaviour — but now the bias is the user's *declared* omissions, not a hard-coded limitation.
     """
     seen: dict[str, None] = {}
-    for s in [*load_holdings(), *_read_symbol_file(UNIVERSE_FILE)]:
+    # _safe_load (not load_holdings) so an empty/missing holdings.csv degrades to just the universe
+    # file instead of raising — the back-test cross-section shouldn't require a current book to exist.
+    holdings = [p.symbol for p in _safe_load()]
+    for s in [*holdings, *_read_symbol_file(UNIVERSE_FILE)]:
         if s:
             seen.setdefault(s, None)
     return list(seen)

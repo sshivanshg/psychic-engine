@@ -37,7 +37,11 @@ def _availability_cutoff(as_of):
 
 
 def _pct(new, old):
-    if new is None or old is None or old == 0:
+    """YoY/QoQ growth %. None when the base is non-positive: a percentage off a zero or NEGATIVE base
+    (e.g. a loss-making prior year) is not meaningful and INVERTS the sign — a loss→profit turnaround
+    would read as 'declining'. A negative `new` over a positive base (profit→loss) is a real,
+    correctly-signed decline and is kept."""
+    if new is None or old is None or old <= 0:
         return None
     return (new / old - 1) * 100
 
@@ -75,6 +79,26 @@ def _year_ago(df: pd.DataFrame, latest):
         if r["period_end"].year == ty and r["period_end"].month == tm:
             return r
     return None
+
+
+def calendar_yoy_pct(period_ends, values) -> pd.Series:
+    """Calendar-aware YoY % for a quarterly series, robust to gaps — the SHARED definition the eval
+    harness and the live Fundamental agent both use, so the back-test scores the SAME transform the
+    agent reports (not a `shift(4)` proxy).
+
+    For each quarter we compare to the SAME calendar quarter one year earlier (year-1, same month) —
+    matching `_year_ago` — never 'four rows back' (`shift(4)`), which silently mis-pairs across
+    yfinance's quarter gaps (a single missing quarter turns a YoY into a 9-month change). Returns a
+    float Series positionally aligned to `period_ends`; NaN when there is no year-ago match OR the
+    base is <= 0 (the same positive-base guard as `_pct`)."""
+    pe = pd.to_datetime(pd.Series(list(period_ends)).reset_index(drop=True))
+    val = pd.Series(list(values), dtype=float).reset_index(drop=True)
+    by_ym: dict[tuple[int, int], float] = {(d.year, d.month): v for d, v in zip(pe, val)}
+    out = []
+    for d, v in zip(pe, val):
+        base = by_ym.get((d.year - 1, d.month))
+        out.append((v / base - 1) * 100 if (base is not None and base > 0) else float("nan"))
+    return pd.Series(out, index=pd.DatetimeIndex(pe), dtype=float)
 
 
 def load_fundamentals(symbols, as_of=None) -> dict:

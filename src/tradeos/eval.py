@@ -29,9 +29,11 @@ Honesty caveats baked in:
 - **Fundamental signals are point-in-time.** They are read at their AVAILABILITY date
   (`period_end + config.ANNOUNCEMENT_LAG_DAYS`), so a quarter only enters the cross-section once its
   results were public — never on period-end. (Prime Directive #2.)
-- **Costs are reported.** Each signal shows the gross long-short tercile spread AND a net spread
-  after `config.COST_BPS` of round-trip transaction cost (~4 legs/cycle for a rebalanced long-short).
-  Directive #4: net is shown, not just a gross upper bound.
+- **Costs are reported.** Each signal shows the gross long-short tercile spread (signed) AND a NET
+  edge = `|gross| − config.COST_BPS` round-trip cost (~4 legs/cycle for a rebalanced long-short),
+  i.e. the cost-adjusted edge of trading the signal in its predictive direction. Cost always erodes
+  the edge — for a mean-reversion signal (negative gross) too. Directive #4: net is shown, not just a
+  gross upper bound.
 - **Survivorship is flagged, not hidden.** The universe is your CURRENT holdings, so sold/delisted
   names are absent — an upward bias the result dict and the printout both call out (Directive #3).
   A delisted-inclusive universe needs a point-in-time constituents feed; that's the next data lift.
@@ -48,7 +50,7 @@ import numpy as np
 import pandas as pd
 
 from .config import ANNOUNCEMENT_LAG_DAYS, COST_BPS, UNIVERSE_FILE, load_universe
-from .fundamental import load_fundamentals
+from .fundamental import calendar_yoy_pct, load_fundamentals
 from .risk import _load_panels
 
 MIN_HISTORY = 250        # a name needs ~1y of daily obs to contribute a meaningful signal
@@ -81,8 +83,10 @@ def _fundamental_feature(df: pd.DataFrame, which: str,
     """One quarterly fundamental feature as a Series indexed by its AVAILABILITY date.
 
     Availability = `period_end + lag_days` (results-announcement lag): the first day the number was
-    public. YoY uses a 4-quarter shift (approximate — yfinance quarters can have gaps); margin is a
-    level. Returned point-in-time so the eval can align it to prices with no look-ahead.
+    public. YoY uses `calendar_yoy_pct` — the SAME calendar-aware (year-1, same-month) transform the
+    live Fundamental agent reports, gap-robust and guarded against a non-positive base — so the eval
+    scores the signal the agent actually shows. Margin is a level. Returned point-in-time so the eval
+    can align it to prices with no look-ahead.
     """
     d = df.dropna(subset=["period_end"]).sort_values("period_end")
     if d.empty:
@@ -91,14 +95,14 @@ def _fundamental_feature(df: pd.DataFrame, which: str,
     rev = d["total_revenue"].astype(float)
     ni = d["net_income"].astype(float)
     if which == "net_margin":
-        val = ni / rev * 100
+        val = (ni / rev * 100).to_numpy(dtype=float)
     elif which == "revenue_yoy":
-        val = (rev / rev.shift(4) - 1) * 100
+        val = calendar_yoy_pct(d["period_end"], rev).to_numpy(dtype=float)
     elif which == "earnings_yoy":
-        val = (ni / ni.shift(4) - 1) * 100
+        val = calendar_yoy_pct(d["period_end"], ni).to_numpy(dtype=float)
     else:
         raise ValueError(f"unknown fundamental signal {which!r}")
-    out = pd.Series(val.to_numpy(dtype=float), index=avail)
+    out = pd.Series(val, index=avail)
     return out.replace([np.inf, -np.inf], np.nan).dropna()
 
 
@@ -131,9 +135,16 @@ def _fundamental_panels(adj: pd.DataFrame, fundamentals: dict, symbols, which: s
 
 
 def _net_spread(gross, cost_bps: float):
-    """Net the gross long-short tercile spread for transaction cost. A long-short tercile rebalanced
-    each horizon pays ~4 legs/cycle (enter+exit on both the long and the short book)."""
-    return None if gross is None else gross - 4 * cost_bps / 1e4
+    """Net edge of the DIRECTIONALLY-traded long-short tercile, after round-trip cost.
+
+    The gross tercile spread is signed top-minus-bottom; its SIGN tells you which way the signal
+    predicts (a mean-reversion signal like RSI legitimately has a NEGATIVE gross). You'd trade it in
+    its predictive direction, capturing |gross|, so the achievable net edge is `|gross| − round-trip
+    cost`. A tercile rebalanced each horizon pays ~4 legs/cycle (enter+exit on both the long and the
+    short book). Subtracting cost from the SIGNED gross instead would amplify a negative spread —
+    making costs look like they *help* a losing book. `|gross| − cost` always erodes the edge (it can
+    go negative when cost exceeds the spread ⇒ the signal doesn't survive cost), regardless of sign."""
+    return None if gross is None else abs(gross) - 4 * cost_bps / 1e4
 
 
 def _spearman(x: pd.Series, y: pd.Series):
@@ -167,6 +178,12 @@ def _newey_west_tstat(series: pd.Series, lag: int):
     if var_mean <= 0:
         return mean, None
     return mean, mean / math.sqrt(var_mean)
+
+
+def _p_two_sided(t):
+    """Two-sided p-value for a (large-sample HAC ⇒ ~normal) t-stat: P(|Z| > |t|) = erfc(|t|/√2).
+    None when there's no t-stat. Used to deflate for multiple testing (Directive #5)."""
+    return None if t is None else math.erfc(abs(t) / math.sqrt(2))
 
 
 def _signal_panels(adj: pd.DataFrame, symbols, fn, horizon: int):
@@ -268,6 +285,7 @@ def _score(sig: pd.DataFrame, fwd: pd.DataFrame, step: int, nw_lag: int,
         "ic": _round(mean_ic),
         "icir": _round(icir, 2),
         "t_stat": _round(t_stat, 2),
+        "p_value": _round(_p_two_sided(t_stat), 4),   # two-sided, from the Newey-West t
         "hit_rate_pct": _round(hit, 1),
         "base_rate_pct": _round(base, 1),
         "ls_spread_pct": _round(spread * 100, 2) if spread is not None else None,
@@ -276,10 +294,18 @@ def _score(sig: pd.DataFrame, fwd: pd.DataFrame, step: int, nw_lag: int,
     }
 
 
-def evaluate(horizon: int = 21, step: int = 5, as_of=None, cost_bps: float | None = None) -> dict:
+def evaluate(horizon: int = 21, step: int = 5, as_of=None, cost_bps: float | None = None,
+             vintage_asof=None) -> dict:
     cost_bps = COST_BPS if cost_bps is None else cost_bps
     symbols = load_universe()          # holdings ∪ sold/delisted names → fights survivorship bias
-    _close, adj, _vol = _load_panels(symbols, as_of)
+    if vintage_asof is not None:
+        # Reproducible replay: read prices AS THEY WERE KNOWN at `vintage_asof` (the append-only
+        # revision log), so a re-run isn't silently restated by a later vendor re-adjustment. Needs
+        # vintages captured by then; falls back to empty (honest) if the archive doesn't cover it.
+        from .risk import load_panels_asof
+        _close, adj, _vol = load_panels_asof(symbols, as_of, vintage_asof)
+    else:
+        _close, adj, _vol = _load_panels(symbols, as_of)
     if adj.empty:
         raise RuntimeError("No price data. Run `tradeos ingest` first.")
 
@@ -306,6 +332,16 @@ def evaluate(horizon: int = 21, step: int = 5, as_of=None, cost_bps: float | Non
         if not sig.empty:
             results[name] = _score(sig, fwd, step, FUND_NW_LAG, "fundamental", cost_bps)
 
+    # Multiple testing (Directive #5): several signals are scored, so a lone p<0.05 is suspect.
+    # Deflate with a Bonferroni floor (α/n) and flag both the raw and the family-wise verdict, so the
+    # headline can't quietly promote one trial out of many. (Conservative; not the only valid method.)
+    n_sig = len(results)
+    bonf_alpha = round(0.05 / n_sig, 4) if n_sig else None
+    for s in results.values():
+        p = s.get("p_value")
+        s["significant_raw"] = bool(p is not None and p < 0.05)
+        s["significant_bonferroni"] = bool(p is not None and bonf_alpha is not None and p < bonf_alpha)
+
     return {
         "horizon_days": horizon,
         "step_days": step,
@@ -313,7 +349,9 @@ def evaluate(horizon: int = 21, step: int = 5, as_of=None, cost_bps: float | Non
         "nw_lag": nw_lag,
         "lag_days": ANNOUNCEMENT_LAG_DAYS,
         "cost_bps": cost_bps,
-        "n_signals": len(results),
+        "vintage_asof": str(vintage_asof) if vintage_asof is not None else None,
+        "n_signals": n_sig,
+        "bonferroni_alpha": bonf_alpha,   # family-wise α floor = 0.05 / n_signals
         "survivorship": _survivorship_note(),
         "signals": results,
     }

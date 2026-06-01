@@ -5,6 +5,7 @@ description = "Personal portfolio intelligence — Phase 0: data foundation"
 requires-python = ">=3.12"
 dependencies = [
     "psycopg[binary]>=3.2",   # PostgreSQL driver (v3). [binary] ships precompiled wheels.
+    "psycopg-pool>=3.2",      # process-wide connection pool (amortises connect cost on API reads)
     "yfinance>=0.2.40",       # free daily OHLCV for NSE/BSE (uses the ".NS"/".BO" suffix)
     "pandas>=2.2",            # yfinance returns DataFrames; we reshape them here
     "numpy>=1.26",            # risk math (volatility, beta, drawdown, concentration)
@@ -15,6 +16,7 @@ dependencies = [
     "pgvector>=0.3",          # psycopg adapter for the vector column
     "fastapi>=0.136",         # Phase 5: JSON API over the engine (dashboard backend)
     "uvicorn[standard]>=0.48",  # ASGI server for the FastAPI app
+    "python-multipart>=0.0.9",  # multipart/form-data parsing for the doc-upload route
 ]
 
 [dependency-groups]

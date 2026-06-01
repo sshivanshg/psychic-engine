@@ -3,6 +3,7 @@
   import { page } from '$app/stores';
   import { api } from '$lib/api';
   import { num, pct, signed, dialClass } from '$lib/format';
+  import { theme } from '$lib/theme';
   import Chart from '$lib/Chart.svelte';
   import { priceChartOption, attentionGauge, rsiGauge, returnsBarOption } from '$lib/charts';
 
@@ -71,12 +72,12 @@
   <div class="grid3">
     <div class="panel">
       <div class="panel-h"><h2>Price &amp; moving averages</h2><span class="hint">{td.trend ?? ''} · {pct(t.pct_from_52w_high)} from 52w high</span></div>
-      {#if series}<Chart option={priceChartOption(series)} height="340px" />
+      {#if series}{#key $theme}<Chart option={priceChartOption(series)} height="340px" />{/key}
       {:else}<div class="note">no price series</div>{/if}
     </div>
     <div>
-      <div class="panel" style="margin-bottom:1rem"><Chart option={attentionGauge(card.attention?.score ?? null)} height="150px" /></div>
-      <div class="panel"><Chart option={rsiGauge(t.rsi_14 ?? null)} height="150px" /></div>
+      <div class="panel" style="margin-bottom:1rem">{#key $theme}<Chart option={attentionGauge(card.attention?.score ?? null)} height="150px" />{/key}</div>
+      <div class="panel">{#key $theme}<Chart option={rsiGauge(t.rsi_14 ?? null)} height="150px" />{/key}</div>
     </div>
   </div>
 
@@ -91,7 +92,7 @@
       <div class="spread"><span class="k">vs 200-day SMA</span><span class="v">{pct(t.price_vs_sma200_pct)}</span></div>
       <div class="spread"><span class="k">MACD histogram</span><span class="v">{num(t.macd_hist)}</span></div>
       <div class="spread"><span class="k">From 52-week high</span><span class="v">{pct(t.pct_from_52w_high)}</span></div>
-      <div style="margin-top:0.6rem"><Chart option={returnsBarOption(card)} height="150px" /></div>
+      <div style="margin-top:0.6rem">{#key $theme}<Chart option={returnsBarOption(card)} height="150px" />{/key}</div>
     </div>
 
     <div class="panel">

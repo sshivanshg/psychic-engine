@@ -3,6 +3,7 @@
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
+  import { theme, toggleTheme } from '$lib/theme';
 
   let { children } = $props();
   let holdings = $state<any[]>([]);
@@ -17,8 +18,10 @@
 
   const nav = [
     { href: '/', label: 'Overview' },
+    { href: '/live', label: 'Reasoning Monitor' },
     { href: '/briefing', label: 'Briefing' },
-    { href: '/eval', label: 'Signal Eval' }
+    { href: '/eval', label: 'Signal Eval' },
+    { href: '/manage', label: 'Manage' }
   ];
   const active = (href: string, path: string) => (href === '/' ? path === '/' : path.startsWith(href));
 </script>
@@ -47,7 +50,14 @@
       {/if}
     </nav>
 
-    <div style="margin-top:auto" class="note">Descriptive only — you make the call.</div>
+    <div style="margin-top:auto; display:flex; flex-direction:column; gap:0.7rem">
+      <button class="theme-toggle" onclick={toggleTheme}
+              title="Switch theme" aria-label="Switch theme">
+        <span class="ti">{$theme === 'black' ? '☀' : '☾'}</span>
+        <span>{$theme === 'black' ? 'Light theme' : 'Black theme'}</span>
+      </button>
+      <div class="note">Descriptive only — you make the call.</div>
+    </div>
   </aside>
 
   <main class="content"><div class="wrap">{@render children()}</div></main>

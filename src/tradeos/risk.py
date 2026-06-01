@@ -110,6 +110,60 @@ def _load_panels(symbols, as_of=None):
     return close, adj, volume
 
 
+def _as_date(x):
+    import datetime as _dt
+    if isinstance(x, _dt.datetime):
+        return x.date()
+    if isinstance(x, _dt.date):
+        return x
+    return _dt.date.fromisoformat(str(x)[:10])
+
+
+def _latest_vintage_by_cell(rows):
+    """Pure: from price_vintages rows (symbol, date, vintage_date, close, adj_close, volume) already
+    filtered to `vintage_date <= target`, keep ONLY the latest vintage per (symbol, date) — the value
+    as it was KNOWN at the target. Reproducible-replay core; unit-tested without a DB."""
+    best: dict = {}
+    for sym, date, vd, c, a, v in rows:
+        key = (sym, date)
+        cur = best.get(key)
+        if cur is None or vd > cur[2]:
+            best[key] = (sym, date, vd, c, a, v)
+    return list(best.values())
+
+
+def load_panels_asof(symbols, as_of, vintage_asof):
+    """Reproducible read: reconstruct (close, adj_close, volume) panels AS THEY WERE KNOWN at
+    `vintage_asof` (from the append-only price-revision log), for trading dates <= `as_of`.
+
+    A back-test replayed months later sees the same numbers it saw at decision time, even after the
+    vendor retroactively re-adjusts history. Empty panels when no vintages cover the request (e.g.
+    dates before the project's first ingest — they were never observed, an honest gap, not a fabricated
+    number). `as_of=None` ⇒ no trading-date bound. Requires the `price_vintages` table (Phase-5 schema).
+    """
+    if not symbols:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    placeholders = ",".join(["%s"] * len(symbols))
+    sql = (f"SELECT symbol, date, vintage_date, close, COALESCE(adj_close, close) AS adj_close, volume "
+           f"FROM price_vintages WHERE symbol IN ({placeholders}) AND vintage_date <= %s")
+    params: list = [*symbols, _as_date(vintage_asof)]
+    if as_of is not None:
+        sql += " AND date <= %s"
+        params.append(_as_date(as_of))
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    rows = _latest_vintage_by_cell(rows)
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    df = pd.DataFrame([(s, d, c, a, v) for s, d, _vd, c, a, v in rows],
+                      columns=["symbol", "date", "close", "adj_close", "volume"])
+    close = df.pivot(index="date", columns="symbol", values="close").sort_index()
+    adj = df.pivot(index="date", columns="symbol", values="adj_close").sort_index()
+    volume = df.pivot(index="date", columns="symbol", values="volume").sort_index()
+    return close, adj, volume
+
+
 def _ewma_cov(returns: pd.DataFrame, lam: float = LAMBDA) -> pd.DataFrame:
     """EWMA covariance (daily) on a common-sample return matrix. Most-recent obs weighted most."""
     r = returns.dropna(how="any")
@@ -124,7 +178,13 @@ def _ewma_cov(returns: pd.DataFrame, lam: float = LAMBDA) -> pd.DataFrame:
 
 
 def _ewma_vol_series(returns: pd.Series, lam: float = LAMBDA) -> pd.Series:
-    return np.sqrt(returns.pow(2).ewm(alpha=1 - lam, adjust=False).mean())
+    """Per-day EWMA(λ) conditional vol on DE-MEANED returns — the same λ and de-meaning convention as
+    `_ewma_cov`, so the FHS filter's vol is consistent with the covariance diagonal rather than a
+    second, zero-mean estimator. FHS needs the vol at EVERY historical day to standardise that day's
+    return (which the single-point windowed cov estimator can't give), hence a recursive series — but
+    computed on the same centred returns so the two paths don't silently disagree."""
+    centred = returns - returns.mean()
+    return np.sqrt(centred.pow(2).ewm(alpha=1 - lam, adjust=False).mean())
 
 
 def _fhs_var_cvar(port_ret: pd.Series, conf: float, lam: float = LAMBDA):
@@ -161,10 +221,9 @@ def _ledoit_wolf_shrink(cov: np.ndarray, returns: np.ndarray):
         return cov, 0.0
     x = returns - returns.mean(axis=0)
     t = x.shape[0]
-    pi_mat = np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            pi_mat[i, j] = np.mean((x[:, i] * x[:, j] - cov[i, j]) ** 2)
+    # π_ij = mean_t (x_ti·x_tj − cov_ij)²  — vectorised (was an O(n²) Python double loop).
+    prod = np.einsum("ti,tj->tij", x, x)
+    pi_mat = ((prod - cov) ** 2).mean(axis=0)
     pi = float(pi_mat.sum())
     rho = float(np.trace(pi_mat))                       # diagonal term (off-diag omitted → conservative)
     delta = float(np.clip((pi - rho) / gamma / t, 0.0, 1.0))
@@ -217,8 +276,9 @@ def compute_risk(as_of=None, horizon: str = "annual", *, panels=None, positions=
         raise RuntimeError("No price data found. Run `tradeos ingest` first.")
 
     have_bench = BENCHMARK in adj.columns
-    log_ret = np.log(adj).diff()        # total-return → vol/covariance
-    simple_ret = adj.pct_change()       # total-return → VaR/stress/beta
+    adj_pos = adj.where(adj > 0)        # non-positive vendor ticks ⇒ NaN, never -inf in log / inf in pct_change
+    log_ret = np.log(adj_pos).diff()    # total-return → vol/covariance
+    simple_ret = adj_pos.pct_change()   # total-return → VaR/stress/beta
     last_close = close.ffill().iloc[-1]  # actual (split-adjusted) price → value/liquidity
     as_of_date = close.index[-1]
 
@@ -242,12 +302,15 @@ def compute_risk(as_of=None, horizon: str = "annual", *, panels=None, positions=
     corr_matrix: dict[str, dict] = {}
     avg_pairwise = None
     shrinkage_delta = 0.0
+    cov_obs: int | None = None   # common-sample length behind the EWMA covariance (provenance)
+    var_obs: int | None = None   # common-sample length behind the historical VaR/CVaR P&L
 
     if asset_syms:
         sig_d = cov_d.loc[asset_syms, asset_syms].values
+        cov_sample = log_ret[asset_syms].dropna(how="any")   # common sample (dropna how="any")
+        cov_obs = int(len(cov_sample))
         if COV_SHRINKAGE and len(asset_syms) >= 2:
-            rmat = log_ret[asset_syms].dropna(how="any").to_numpy()
-            sig_d, shrinkage_delta = _ledoit_wolf_shrink(sig_d, rmat)
+            sig_d, shrinkage_delta = _ledoit_wolf_shrink(sig_d, cov_sample.to_numpy())
         pw = np.array([weights[s] for s in asset_syms])
 
         var_p_daily = float(pw @ sig_d @ pw)
@@ -287,6 +350,7 @@ def compute_risk(as_of=None, horizon: str = "annual", *, panels=None, positions=
     if asset_syms:
         ps = simple_ret[asset_syms].dropna(how="any")
         if not ps.empty:
+            var_obs = int(len(ps))
             pw = np.array([weights[s] for s in asset_syms])
             port_ret = pd.Series(ps.values @ pw, index=ps.index)
             v95, c95 = _var_cvar(port_ret, 0.95)
@@ -348,6 +412,8 @@ def compute_risk(as_of=None, horizon: str = "annual", *, panels=None, positions=
         "var_99_fhs_pct": _round(_scale(vf99, hf) * 100) if vf99 is not None else None,
         "cvar_99_fhs_pct": _round(_scale(cf99, hf) * 100) if cf99 is not None else None,
         "cov_shrinkage": _round(shrinkage_delta, 3),
+        "cov_obs": cov_obs,          # # of common trading days behind the covariance (provenance)
+        "var_obs": var_obs,          # # of common trading days behind the historical VaR/CVaR
         "worst_1d_pct": _round(worst[1] * 100 if worst[1] is not None else None),
         "worst_5d_pct": _round(worst[5] * 100 if worst[5] is not None else None),
         "worst_10d_pct": _round(worst[10] * 100 if worst[10] is not None else None),
@@ -357,16 +423,30 @@ def compute_risk(as_of=None, horizon: str = "annual", *, panels=None, positions=
         "max_days_to_liquidate": _round(max(dtl.values())) if dtl else None,
     }
 
+    # Provenance: a holding's short history truncates the COMMON sample (dropna how="any"), so the
+    # whole book's vol/tail can quietly rest on far fewer days than "2y" implies. Surface it rather
+    # than letting an authoritative-looking number hide the thin sample behind it (Directives #7/#8).
+    data_warnings: list[str] = []
+    if var_obs is not None and var_obs < DAYS_PER_YEAR:
+        data_warnings.append(
+            f"tail/VaR estimated on only {var_obs} common trading days (a holding's short history "
+            "truncates the common sample) — treat horizon tails as low-confidence")
+    if cov_obs is not None and cov_obs < MIN_BETA_OBS:
+        data_warnings.append(f"covariance estimated on only {cov_obs} common observations")
+
     return {
         "as_of": str(as_of_date),
         "benchmark": BENCHMARK if have_bench else None,
         "horizon": horizon_label,
         "horizon_days": horizon_days,
+        "tail_scaling": "sqrt-time (iid approximation)",
         "method": (
             "total-return prices for returns, split-adjusted for levels/value; "
             "log-return EWMA(λ=0.94) covariance + Ledoit-Wolf shrinkage; adjusted full-sample beta "
-            f"(⅔·raw+⅓); historical + FHS-conditional VaR/CVaR; vol & VaR at {horizon_label} horizon"
+            f"(⅔·raw+⅓); historical + FHS-conditional VaR/CVaR; σ & VaR scaled by √T to the "
+            f"{horizon_label} horizon — an iid approximation (the 1-day VaR limit check is exact)"
         ),
+        "data_warnings": data_warnings,
         "portfolio": portfolio,
         "positions": positions_out,
         "correlation": corr_matrix,

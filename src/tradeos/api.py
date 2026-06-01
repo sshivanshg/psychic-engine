@@ -12,9 +12,12 @@ The SvelteKit dev server (5173) calls this cross-origin; production can serve th
 
 import datetime as dt
 import os
+import time
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .config import PROJECT_ROOT
@@ -34,13 +37,17 @@ app.add_middleware(
 )
 
 
-def _parse_as_of(as_of: str | None):
-    if not as_of:
+def _parse_date(value: str | None, field: str = "date"):
+    if not value:
         return None
     try:
-        return dt.date.fromisoformat(as_of)
+        return dt.date.fromisoformat(value)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"bad as_of (want YYYY-MM-DD): {e}") from e
+        raise HTTPException(status_code=400, detail=f"bad {field} (want YYYY-MM-DD): {e}") from e
+
+
+def _parse_as_of(as_of: str | None):
+    return _parse_date(as_of, "as_of")
 
 
 def _jsonable_analysis(a: dict) -> dict:
@@ -73,30 +80,43 @@ def holdings() -> list[dict]:
     return [{"symbol": p.symbol, "quantity": p.quantity, "avg_cost": p.avg_cost} for p in _safe_load()]
 
 
+def _cached_analysis(aod, horizon: str) -> dict:
+    """The FACTUAL (narrate=False) analysis, memoised by (as_of, horizon) for a short TTL. `memo`
+    hands back a deep copy, so callers can safely mutate (annotate_deltas) and narrate on top. Both
+    the portfolio and per-stock routes share this key, so the engine runs once per (as_of, horizon)."""
+    from .cache import memo
+    from .orchestrator import analyze
+    return memo(("analysis", str(aod), horizon),
+                lambda: analyze(as_of=aod, horizon=horizon, narrate=False, snapshot=False))
+
+
 @app.get("/api/portfolio")
 def portfolio(horizon: str = "annual", as_of: str | None = None, narrate: bool = False) -> dict:
     """The dashboard payload: per-stock cards (6 dims + attention + confidence + delta) + overviews."""
-    from .orchestrator import analyze
+    from .orchestrator import narrate_cards
     from .snapshots import annotate_deltas
     aod = _parse_as_of(as_of)
-    a = _guard(lambda: analyze(as_of=aod, horizon=horizon, narrate=narrate, snapshot=False))
+    a = _guard(lambda: _cached_analysis(aod, horizon))
     annotate_deltas(a["cards"])         # show "what changed vs the last saved run" without persisting a new one
+    if narrate:
+        a["narratives"] = narrate_cards(a["cards"])
     return _jsonable_analysis(a)
 
 
 @app.get("/api/stock/{symbol}")
 def stock(symbol: str, horizon: str = "annual", as_of: str | None = None, narrate: bool = True) -> dict:
-    """One holding's full card + (opt-in) LLM reasoning trace."""
-    from .orchestrator import analyze
+    """One holding's full card + (opt-in) LLM reasoning trace. Reuses the cached factual analysis and
+    narrates ONLY this holding — not the whole book (which would fire an LLM call per holding)."""
+    from .orchestrator import narrate_cards
     from .snapshots import annotate_deltas
     aod = _parse_as_of(as_of)
-    a = _guard(lambda: analyze(as_of=aod, horizon=horizon, narrate=narrate, snapshot=False))
+    a = _guard(lambda: _cached_analysis(aod, horizon))
     annotate_deltas(a["cards"])
     sym = symbol.upper()
     card = next((c for c in a["cards"] if c["symbol"] == sym), None)
     if card is None:
         raise HTTPException(status_code=404, detail=f"{sym} not in the portfolio analysis")
-    nar = a.get("narratives", {}).get(sym)
+    nar: Any = (narrate_cards([card]) if narrate else {}).get(sym)   # one holding, not the entire book
     return {"card": card, "narrative": nar.model_dump() if hasattr(nar, "model_dump") else nar}
 
 
@@ -112,20 +132,83 @@ def stock_series(symbol: str, as_of: str | None = None, lookback: int = Query(40
 
 @app.get("/api/risk")
 def risk(horizon: str = "annual", as_of: str | None = None) -> dict:
+    from .cache import memo
     from .risk import compute_risk
-    return _guard(lambda: compute_risk(as_of=_parse_as_of(as_of), horizon=horizon))
+    aod = _parse_as_of(as_of)
+    return _guard(lambda: memo(("risk", str(aod), horizon),
+                               lambda: compute_risk(as_of=aod, horizon=horizon)))
 
 
 @app.get("/api/eval")
 def eval_(horizon: int = Query(21, ge=1), step: int = Query(5, ge=1)) -> dict:
+    from .cache import memo
     from .eval import evaluate
-    return _guard(lambda: evaluate(horizon=horizon, step=step))
+    return _guard(lambda: memo(("eval", horizon, step), lambda: evaluate(horizon=horizon, step=step)))
 
 
 @app.get("/api/briefing")
 def briefing(horizon: str = "annual", as_of: str | None = None) -> dict:
     from .briefing import run_briefing
     return _guard(lambda: run_briefing(as_of=_parse_as_of(as_of), horizon=horizon))
+
+
+def _sse_default(o):
+    """JSON fallback for the event stream: numpy scalars → python, dates → ISO, else str."""
+    if hasattr(o, "item"):                      # numpy scalar (np.float64 etc.)
+        try:
+            return o.item()
+        except Exception:                        # noqa: BLE001
+            pass
+    if isinstance(o, (dt.date, dt.datetime)):
+        return o.isoformat()
+    return str(o)
+
+
+@app.get("/api/stream/analyze")
+def stream_analyze(horizon: str = "annual", as_of: str | None = None, narrate: bool = True):
+    """LIVE multi-agent run as Server-Sent Events — the dashboard's Reasoning Monitor subscribes here
+    and watches every stage as it happens: data load → each of the 6 agents (with its output) →
+    per-holding reads → LLM synthesis. Runs the engine FRESH (uncached) with `on_event` wired to a
+    queue; a worker thread runs `analyze`, this generator streams its events. snapshot=False (a 'watch'
+    run shouldn't persist a snapshot). Descriptive only — it explains, it never advises."""
+    import json
+    import queue
+    import threading
+
+    from .orchestrator import analyze
+
+    aod = _parse_as_of(as_of)
+    events: queue.Queue = queue.Queue()
+    DONE = object()
+
+    def worker() -> None:
+        try:
+            analyze(as_of=aod, horizon=horizon, narrate=narrate, snapshot=False,
+                    on_event=lambda etype, payload: events.put({"type": etype, "payload": payload}))
+        except Exception as e:                   # surface the engine's "no data" etc. as an event
+            events.put({"type": "error", "payload": {"message": str(e)}})
+        finally:
+            events.put(DONE)
+
+    threading.Thread(target=worker, daemon=True).start()
+    pacing = float(os.getenv("STREAM_PACING_MS", "140")) / 1000.0
+
+    def gen():
+        yield ": reasoning-monitor stream open\n\n"     # prompt the client to start rendering
+        while True:
+            item = events.get()
+            if item is DONE:
+                yield "event: end\ndata: {}\n\n"
+                return
+            yield f"data: {json.dumps(item, default=_sse_default)}\n\n"
+            # Pace the deterministic cascade so it's watchable; LLM events arrive in real time.
+            if pacing > 0 and not str(item.get("type", "")).startswith("narration"):
+                time.sleep(pacing)
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/docs/status")
@@ -146,6 +229,127 @@ class AskRequest(BaseModel):
 def ask(req: AskRequest) -> dict:
     from .docs import ask as rag_ask
     return _guard(lambda: rag_ask(req.symbol, req.question))
+
+
+# ----------------------------------------------------------------------------------------------
+# WRITE SEAM (mutations). Still THIN: each route just calls the SAME function the CLI uses
+# (config.add_holding / remove_holding, ingest.*, docs.add_document) — I/O orchestration, never
+# quant logic — and clears the read cache so the dashboard reflects the change immediately. Safe at
+# the 127.0.0.1 single-user default; there is no auth, so don't expose these on 0.0.0.0 unguarded.
+# ----------------------------------------------------------------------------------------------
+
+_ALLOWED_DOC_EXT = {".pdf", ".txt", ".md"}
+_MAX_DOC_BYTES = 25 * 1024 * 1024          # 25 MB — a generous cap for a results PDF / transcript
+
+
+def _holdings_payload(positions: list) -> list[dict]:
+    return [{"symbol": p.symbol, "quantity": p.quantity, "avg_cost": p.avg_cost} for p in positions]
+
+
+def _clear_read_cache() -> None:
+    from .cache import clear
+    clear()
+
+
+class HoldingRequest(BaseModel):
+    symbol: str
+    quantity: float
+    avg_cost: float | None = None
+    fetch: bool = True                     # also pull this name's price history now (like `tradeos add`)
+
+
+@app.post("/api/holdings")
+def add_holding_route(req: HoldingRequest) -> dict:
+    """Add/replace a holding (writes holdings.csv via the same `config.add_holding` the CLI uses),
+    optionally fetch its price history, and invalidate the read cache."""
+    from .config import add_holding
+    sym = req.symbol.strip().upper()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    positions = _guard(lambda: add_holding(sym, req.quantity, req.avg_cost))
+    warning: str | None = None
+    if req.fetch:
+        try:
+            from .ingest import ingest_symbols
+            ingest_symbols([sym], with_benchmark=True)
+        except Exception as e:             # a data hiccup must not lose the persisted holding
+            warning = f"holding saved, but price fetch failed: {e}"
+    _clear_read_cache()
+    return {"holdings": _holdings_payload(positions), "fetched": req.fetch and warning is None,
+            "warning": warning}
+
+
+@app.delete("/api/holdings/{symbol}")
+def remove_holding_route(symbol: str) -> dict:
+    """Remove a holding (same `config.remove_holding` as `tradeos remove`) and invalidate the cache."""
+    from .config import remove_holding
+    sym = symbol.strip().upper()
+    positions = _guard(lambda: remove_holding(sym))
+    _clear_read_cache()
+    return {"holdings": _holdings_payload(positions)}
+
+
+class IngestRequest(BaseModel):
+    symbols: list[str] | None = None
+
+
+@app.post("/api/ingest")
+def ingest_route(req: IngestRequest | None = None) -> dict:
+    """Refresh price/fundamentals data (same engine as `tradeos ingest`). With `symbols`, refreshes
+    just those names; otherwise the whole book. Can take a while (it hits yfinance)."""
+    syms = [s.strip().upper() for s in (req.symbols if req and req.symbols else []) if s.strip()]
+
+    def run() -> int | None:
+        if syms:
+            from .ingest import ingest_symbols
+            return ingest_symbols(syms, with_benchmark=True)
+        from .ingest import ingest
+        ingest()
+        return None
+
+    rows = _guard(run)
+    _clear_read_cache()
+    return {"status": "ok", "symbols": syms or "all", "rows": rows}
+
+
+@app.post("/api/docs")
+async def docs_add(
+    symbol: str = Form(...),
+    file: UploadFile = File(...),
+    period: str | None = Form(None),
+    filing_date: str | None = Form(None),
+    source_url: str | None = Form(None),
+) -> dict:
+    """Upload a quarterly result / concall transcript (PDF/txt/md): parse → chunk → embed → store via
+    the same `docs.add_document` as `tradeos docs add`. `period` (quarter-end, YYYY-MM-DD) enables the
+    freshness/coverage check; `filing_date` is the point-in-time public date used by the engine."""
+    from .docs import add_document
+    sym = symbol.strip().upper()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    name = os.path.basename(file.filename or "").strip()
+    ext = os.path.splitext(name)[1].lower()
+    if not name or ext not in _ALLOWED_DOC_EXT:
+        raise HTTPException(status_code=400,
+                            detail=f"unsupported file '{name}'. Allowed types: pdf, txt, md")
+    per = _parse_date(period, "period")
+    fil = _parse_date(filing_date, "filing_date")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
+    if len(data) > _MAX_DOC_BYTES:
+        raise HTTPException(status_code=413, detail=f"file too large (max {_MAX_DOC_BYTES // (1024*1024)} MB)")
+
+    uploads = PROJECT_ROOT / "data" / "uploads"
+    uploads.mkdir(parents=True, exist_ok=True)
+    dest = uploads / f"{sym}__{name}"      # basename-sanitised above ⇒ stays inside uploads/
+    dest.write_bytes(data)
+
+    n = _guard(lambda: add_document(sym, dest, period=per, filing_date=fil, source_url=source_url or None))
+    _clear_read_cache()
+    return {"symbol": sym, "source": name, "chunks": n, "period": period, "stored": bool(n),
+            "note": None if n else "no text could be extracted from the file"}
 
 
 # In production, `npm run build` (adapter-static) emits web/build; serve the SPA from here if present.

@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
   import { num, pct, attnClass, dialClass } from '$lib/format';
+  import { theme } from '$lib/theme';
   import Chart from '$lib/Chart.svelte';
   import { riskContribOption, sectorDonutOption, corrHeatmapOption } from '$lib/charts';
 
@@ -49,18 +50,18 @@
   <div class="grid3">
     <div class="panel">
       <div class="panel-h"><h2>Risk contribution vs weight</h2><span class="hint">%CTR (red) · capital weight (blue)</span></div>
-      {#if rk?.positions}<Chart option={riskContribOption(rk.positions)} height="300px" />{/if}
+      {#if rk?.positions}{#key $theme}<Chart option={riskContribOption(rk.positions)} height="300px" />{/key}{/if}
     </div>
     <div class="panel">
       <div class="panel-h"><h2>Sector exposure</h2><span class="hint">{s?.concentration ?? '—'}</span></div>
-      {#if s?.sectors?.length}<Chart option={sectorDonutOption(s.sectors)} height="300px" />{/if}
+      {#if s?.sectors?.length}{#key $theme}<Chart option={sectorDonutOption(s.sectors)} height="300px" />{/key}{/if}
     </div>
   </div>
 
   {#if rk?.correlation && Object.keys(rk.correlation).length > 1}
     <div class="panel">
       <div class="panel-h"><h2>Correlation matrix</h2><span class="hint">avg pairwise {num(r.avg_pairwise_corr)}</span></div>
-      <Chart option={corrHeatmapOption(rk.correlation)} height="320px" />
+      {#key $theme}<Chart option={corrHeatmapOption(rk.correlation)} height="320px" />{/key}
     </div>
   {/if}
 

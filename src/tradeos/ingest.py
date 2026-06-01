@@ -6,6 +6,7 @@ Idempotent: re-running re-fetches and UPSERTs, so you never get duplicate rows �
 run it as often as you like (e.g. daily after market close).
 """
 
+import math
 from collections.abc import Iterator
 
 import pandas as pd
@@ -66,6 +67,14 @@ ON CONFLICT (symbol) DO UPDATE SET
     held_pct_insiders     = EXCLUDED.held_pct_insiders,
     n_institutions        = EXCLUDED.n_institutions,
     snapshot_at           = EXCLUDED.snapshot_at, ingested_at = now();
+"""
+
+# Append-only price revision log (reproducibility). CURRENT_DATE = the ingest day we observed these
+# values; DO NOTHING dedups same-day re-runs, so re-ingesting is still idempotent.
+VINTAGE_INSERT_SQL = """
+INSERT INTO price_vintages (symbol, date, vintage_date, close, adj_close, volume)
+VALUES (%s, %s, CURRENT_DATE, %s, %s, %s)
+ON CONFLICT (symbol, date, vintage_date) DO NOTHING;
 """
 
 
@@ -147,9 +156,39 @@ def fetch_ohlcv(ticker: str, period: str) -> pd.DataFrame:
     return df
 
 
-def _rows(ticker: str, df: pd.DataFrame) -> Iterator[tuple]:
-    """Turn a DataFrame into the tuples the UPSERT statement expects."""
+def _px_eq(x, y) -> bool:
+    """Equal up to float noise (vendor re-fetch returns identical bits absent a real restatement)."""
+    if x is None or y is None:
+        return x is y
+    return math.isclose(float(x), float(y), rel_tol=1e-9, abs_tol=1e-12)
+
+
+def _changed_vintage_rows(cur, ticker: str, df: pd.DataFrame) -> list[tuple]:
+    """Rows the vendor RESTATED (or new trading days) vs the latest stored `prices` — the revision set
+    to append to price_vintages. MUST run BEFORE the `prices` UPSERT overwrites the old values. Empty
+    on a no-change re-ingest; the full history on the first ingest (when `prices` is empty for the
+    ticker), so every (symbol, date) is logged at least once and an `as_of` replay is reconstructable.
+    """
+    cur.execute("SELECT date, close, adj_close, volume FROM prices WHERE symbol=%s", (ticker,))
+    old = {d: (c, a, v) for d, c, a, v in cur.fetchall()}
+    changed: list[tuple] = []
     for day, row in df.iterrows():
+        vol = int(row["volume"]) if pd.notna(row["volume"]) else None
+        new = (float(row["close"]), float(row["adj_close"]), vol)
+        prev = old.get(day)
+        if prev is None or not (_px_eq(prev[0], new[0]) and _px_eq(prev[1], new[1]) and prev[2] == new[2]):
+            changed.append((ticker, day, new[0], new[1], new[2]))
+    return changed
+
+
+def _rows(ticker: str, df: pd.DataFrame) -> Iterator[tuple]:
+    """Turn a DataFrame into the tuples the UPSERT statement expects.
+
+    Volume is None-safe: a NaN volume (halt days; or a source that doesn't drop them) would make
+    `int(nan)` raise and kill the whole ticker mid-ingest — the column is nullable, so degrade to None.
+    """
+    for day, row in df.iterrows():
+        vol = row["volume"]
         yield (
             ticker,
             day,
@@ -158,7 +197,7 @@ def _rows(ticker: str, df: pd.DataFrame) -> Iterator[tuple]:
             float(row["low"]),
             float(row["close"]),
             float(row["adj_close"]),
-            int(row["volume"]),
+            int(vol) if pd.notna(vol) else None,
         )
 
 
@@ -182,10 +221,15 @@ def ingest_symbols(tickers, *, with_benchmark: bool = False) -> int:
             if df.empty:
                 print(f"  !  {ticker}: no data returned — check the symbol/suffix")
                 continue
+            vintage = _changed_vintage_rows(cur, ticker, df)   # diff vs old prices BEFORE the upsert
             cur.executemany(UPSERT_SQL, list(_rows(ticker, df)))
+            if vintage:
+                cur.executemany(VINTAGE_INSERT_SQL, vintage)   # append-only revision log
             conn.commit()  # commit per ticker so partial runs still persist
             total += len(df)
             msg = f"  ✓  {ticker}: {len(df)} rows"
+            if vintage:
+                msg += f"  + {len(vintage)} vintage rows"
 
             if ticker != BENCHMARK:  # the index has no fundamentals / sector
                 try:

@@ -158,6 +158,16 @@ def test_correlation_matrix_valid(risk):
             assert math.isclose(corr[a][b], corr[b][a], abs_tol=0.01)
 
 
+def test_provenance_sample_sizes_surfaced(risk):
+    """Directive #7/#8: the common-sample length behind the covariance and the historical VaR is
+    reported (not hidden), and the √T horizon scaling is labelled honestly."""
+    p = risk["portfolio"]
+    assert isinstance(p["cov_obs"], int) and p["cov_obs"] > 0
+    assert isinstance(p["var_obs"], int) and p["var_obs"] > 0
+    assert isinstance(risk["data_warnings"], list)
+    assert risk["tail_scaling"] == "sqrt-time (iid approximation)"
+
+
 def test_limits_structure(risk):
     for c in risk["limits"]:
         assert {"metric", "value", "limit", "ok"} <= set(c)

@@ -50,6 +50,6 @@ class AnalysisContext:
         sectors = load_sectors(symbols)
         guidance = load_all_guidance(symbols, as_of)   # point-in-time: only docs public by as_of
         sentiment = load_sentiment(symbols, as_of)     # current snapshot (eval-barred), as_of-filtered if dated
-        ownership = load_ownership(symbols)            # current snapshot only (no history)
+        ownership = load_ownership(symbols, as_of)     # current snapshot; hidden on a historical replay (PIT)
         return cls(as_of, horizon, positions, close, adj, volume, fundamentals, sectors, guidance,
                    sentiment, ownership)
