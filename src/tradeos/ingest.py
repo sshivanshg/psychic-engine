@@ -51,14 +51,6 @@ ON CONFLICT (symbol) DO UPDATE SET
     sector = EXCLUDED.sector, industry = EXCLUDED.industry, name = EXCLUDED.name, ingested_at = now();
 """
 
-SENT_UPSERT_SQL = """
-INSERT INTO sentiment (symbol, title, publisher, published, polarity)
-VALUES (%s, %s, %s, %s, %s)
-ON CONFLICT (symbol, title) DO UPDATE SET
-    publisher = EXCLUDED.publisher, published = EXCLUDED.published,
-    polarity = EXCLUDED.polarity, ingested_at = now();
-"""
-
 OWN_UPSERT_SQL = """
 INSERT INTO ownership (symbol, held_pct_institutions, held_pct_insiders, n_institutions, snapshot_at)
 VALUES (%s, %s, %s, %s, %s)
@@ -76,35 +68,6 @@ INSERT INTO price_vintages (symbol, date, vintage_date, close, adj_close, volume
 VALUES (%s, %s, CURRENT_DATE, %s, %s, %s)
 ON CONFLICT (symbol, date, vintage_date) DO NOTHING;
 """
-
-
-def _parse_published(v):
-    """yfinance gives either an epoch int or an ISO string (schema varies). Return a datetime or None."""
-    import datetime as dt
-    if isinstance(v, (int, float)):
-        try:
-            return dt.datetime.fromtimestamp(int(v), tz=dt.timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return None
-    if isinstance(v, str):
-        try:
-            return dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    return None
-
-
-def fetch_sentiment_rows(ticker: str) -> list[tuple]:
-    """News headlines scored to polarity rows. Best-effort: [] if the feed is empty/unavailable."""
-    from .sentiment import score_text
-    rows = []
-    for art in DEFAULT_SOURCE.news(ticker):
-        title = (art.get("title") or "").strip()
-        if not title:
-            continue
-        rows.append((ticker, title[:500], art.get("publisher"),
-                     _parse_published(art.get("published")), score_text(title)))
-    return rows
 
 
 def fetch_ownership_row(ticker: str) -> tuple | None:
@@ -251,14 +214,9 @@ def ingest_symbols(tickers, *, with_benchmark: bool = False) -> int:
                             msg += f"  + sector {m['sector']}"
                 except Exception as e:  # noqa: BLE001 - sector meta is best-effort
                     log.warning("security meta fetch failed for %s: %s", ticker, e)
-                try:
-                    srows = fetch_sentiment_rows(ticker)
-                    if srows:
-                        cur.executemany(SENT_UPSERT_SQL, srows)
-                        conn.commit()
-                        msg += f"  + {len(srows)} headlines"
-                except Exception as e:  # noqa: BLE001 - news sentiment is best-effort
-                    log.warning("news fetch failed for %s: %s", ticker, e)
+                # news is no longer pre-ingested here — it's fetched LIVE per stock at verdict time
+                # (news.py / refresh_news, via the agent's web search), so it's fresh + relevant rather
+                # than a stale, sparse yfinance snapshot that was empty for most mid/small-caps.
                 try:
                     orow = fetch_ownership_row(ticker)
                     if orow:

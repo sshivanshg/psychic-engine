@@ -158,6 +158,25 @@ def search(symbol: str, query: str, k: int = 5) -> list[dict]:
                 for r in cur.fetchall()]
 
 
+def list_documents(symbol: str) -> list[dict]:
+    """Per-source metadata for a symbol's ingested RAG corpus — browse the knowledge base without
+    pulling embeddings. One row per document (source): chunk count + provenance (period covered,
+    filing date, source URL, when ingested). Newest filing first."""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT source, count(*), max(period), max(filing_date), max(source_url), max(ingested_at) "
+            "FROM doc_chunks WHERE symbol=%s GROUP BY source "
+            "ORDER BY max(filing_date) DESC NULLS LAST, source",
+            (symbol.upper(),),
+        )
+        return [{"source": r[0], "chunks": int(r[1]),
+                 "period": str(r[2])[:10] if r[2] else None,
+                 "filing_date": str(r[3])[:10] if r[3] else None,
+                 "source_url": r[4],
+                 "ingested_at": str(r[5])[:19] if r[5] else None}
+                for r in cur.fetchall()]
+
+
 _ASK_SYSTEM = (
     "You answer questions about a company using ONLY the provided numbered document excerpts (e.g. "
     "an earnings concall). Cite the excerpts you rely on inline as [1], [2] in your answer, and also "

@@ -263,7 +263,7 @@
             <div class="card" style="cursor:default">
               <div class="top">
                 <div>
-                  <div class="sym">{short(c.symbol)}</div>
+                  <div class="sym"><a href={`/analyst/${c.symbol}`} title="Open Analyst Workbench">{short(c.symbol)} ↗</a></div>
                   <div class="sub">wt {pct(c.risk?.weight_pct)} · risk {pct(c.risk?.risk_contribution_pct)} · β {num(c.risk?.beta)}</div>
                 </div>
                 <span class="attn {a.score == null ? 'attn-none' : a.score >= 66 ? 'attn-hot' : a.score >= 40 ? 'attn-warm' : 'attn-calm'}">

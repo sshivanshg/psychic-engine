@@ -14,12 +14,14 @@ Run on ANY symbol in the DB: `python -m tradeos.analyst RELIANCE.NS`.
 
 import argparse
 import os
+import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pydantic import BaseModel
 
 from .agents import REGISTRY
-from .config import BENCHMARK, Position
+from .config import BENCHMARK, CLAUDE_MODEL, Position
 from .context import AnalysisContext
 from .events import catalysts
 from .extraction import load_all_guidance
@@ -37,6 +39,11 @@ log = get_logger()
 ANALYST_MODEL = os.getenv("ANALYST_MODEL", "claude-haiku-4-5")
 # Approx Haiku 4.5 pricing ($/Mtok) for the cost line — override if rates change.
 _PRICE_IN, _PRICE_OUT = 1.0, 5.0
+
+# The DEEP read runs a small multi-agent debate (bull · bear · sector → judge) on a stronger model
+# than the one-line verdict — richer reasoning, still one round-trip per agent. Sonnet by default.
+DEEP_MODEL = os.getenv("DEEP_MODEL", "claude-sonnet-4-6")
+_DEEP_PRICE_IN, _DEEP_PRICE_OUT = 3.0, 15.0   # approx Sonnet 4.6 $/Mtok
 
 
 # ----------------------------- per-symbol facts (free) -----------------------------
@@ -132,6 +139,9 @@ def _digest(f: dict) -> str:
     cats = f.get("catalysts") or []
     if cats:
         L.append("CATALYSTS: " + " ; ".join(f"[{c['event']}] {(c['title'] or '')[:64]}" for c in cats[:6]))
+    cred = f.get("credibility")
+    if cred and cred.get("track_record"):
+        L.append("MGMT CREDIBILITY: " + cred["track_record"])
     return "\n".join(L)
 
 
@@ -151,9 +161,18 @@ class AnalystVerdict(BaseModel):
     confidence: str         # high/medium/low + a few words why
 
 
-def verdict(symbol: str, as_of=None, horizon: str = "annual") -> dict:
+def verdict(symbol: str, as_of=None, horizon: str = "annual", live_news: bool = True,
+            save: bool = True) -> dict:
+    # Live web news ONLY for a live read — fetching today's news for a historical `as_of` would be
+    # look-ahead (Prime Directive #2). Cached within NEWS_TTL_HOURS so repeat briefs don't re-pay.
+    news_status = None
+    if live_news and as_of is None:
+        from .news import refresh_news
+        news_status = refresh_news(symbol)
     facts = assemble_facts(symbol, as_of, horizon)
-    out = {"symbol": symbol, "facts": facts, "verdict": None, "usage": None}
+    from .credibility import assess_credibility
+    facts["credibility"] = assess_credibility(symbol, as_of)  # None unless concalls are ingested (free DB read)
+    out = {"symbol": symbol, "facts": facts, "verdict": None, "usage": None, "news_status": news_status}
     try:
         resp = _get_client().messages.parse(
             model=ANALYST_MODEL, max_tokens=700,
@@ -165,7 +184,111 @@ def verdict(symbol: str, as_of=None, horizon: str = "annual") -> dict:
         out["usage"] = getattr(resp, "usage", None)
     except Exception as e:  # noqa: BLE001
         log.warning("verdict failed for %s: %s", symbol, e)
+    if save and out.get("verdict") is not None:
+        _save_run(out)        # persist to analyst_runs so the dashboard can show past briefs
     return out
+
+
+# ----------------------------- brief history (persistence) -----------------------------
+
+def _json_safe(o):
+    """Coerce engine output (numpy scalars, dates) to JSON-storable primitives for the JSONB payload."""
+    if o is None or isinstance(o, (str, bool, int, float)):
+        return o
+    if hasattr(o, "item") and not isinstance(o, (list, tuple, dict)):
+        try:
+            return o.item()
+        except Exception:  # noqa: BLE001
+            return str(o)
+    if isinstance(o, dict):
+        return {str(k): _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    return str(o)
+
+
+def _facts_snapshot(f: dict) -> dict:
+    """A compact snapshot of the dials/numbers behind a brief — enough to render a history row."""
+    t = f.get("technical") or {}
+    td = t.get("dials", {})
+    fd = (f.get("fundamental") or {}).get("dials", {}) if f.get("fundamental") else {}
+    sn = f.get("sentiment") or {}
+    return {
+        "last_close": f.get("last_close"), "sector": (f.get("macro") or {}).get("sector"),
+        "trend": td.get("trend"), "momentum": td.get("momentum"), "level": td.get("level"),
+        "rsi_14": t.get("rsi_14"),
+        "revenue_growth": fd.get("revenue_growth"), "earnings_growth": fd.get("earnings_growth"),
+        "margin_trend": fd.get("margin_trend"),
+        "attention": (f.get("attention") or {}).get("score"),
+        "confidence": (f.get("confidence") or {}).get("level"),
+        "news_label": sn.get("label"), "n_headlines": sn.get("n_articles"),
+        "catalysts": [{"event": c.get("event"), "title": c.get("title")}
+                      for c in (f.get("catalysts") or [])[:4]],
+    }
+
+
+def _run_cost(out: dict) -> float:
+    """Total $ for one brief: the verdict call + (if a live search ran) the news fetch + search fee."""
+    cost = 0.0
+    u = out.get("usage")
+    if u is not None:
+        cost += getattr(u, "input_tokens", 0) / 1e6 * _PRICE_IN + getattr(u, "output_tokens", 0) / 1e6 * _PRICE_OUT
+    ns = out.get("news_status") or {}
+    if ns.get("fetched"):
+        nu = ns.get("usage")
+        if nu is not None:
+            cost += getattr(nu, "input_tokens", 0) / 1e6 * _PRICE_IN + getattr(nu, "output_tokens", 0) / 1e6 * _PRICE_OUT
+        cost += 0.02
+    return round(cost, 4)
+
+
+def _save_run(out: dict) -> None:
+    """Persist one brief to analyst_runs. Best-effort — a storage hiccup must never break a brief."""
+    v = out.get("verdict")
+    if v is None:
+        return
+    vd = v.model_dump() if hasattr(v, "model_dump") else v
+    f = out.get("facts") or {}
+    cred = f.get("credibility") or {}
+    ns = out.get("news_status") or {}
+    payload = _json_safe({
+        "verdict": vd,
+        "snapshot": _facts_snapshot(f),
+        "credibility": {"track_record": cred.get("track_record"), "checks": cred.get("checks")} if cred else None,
+        "news": {"fetched": ns.get("fetched"), "n": ns.get("n"), "reason": ns.get("reason")},
+    })
+    try:
+        from psycopg.types.json import Json
+
+        from .db import get_connection
+        with get_connection() as c, c.cursor() as cur:
+            cur.execute(
+                "INSERT INTO analyst_runs (symbol, model, cost_usd, one_line, payload) VALUES (%s,%s,%s,%s,%s)",
+                (out["symbol"], ANALYST_MODEL, _run_cost(out), vd.get("one_line"), Json(payload)),
+            )
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not save analyst run for %s: %s", out.get("symbol"), e)
+
+
+def load_history(symbol: str, limit: int = 20) -> list[dict]:
+    """Past briefs for one name, newest first (the history view's data)."""
+    from .db import get_connection
+    with get_connection() as c, c.cursor() as cur:
+        cur.execute("SELECT id, run_at, model, cost_usd, one_line, payload FROM analyst_runs "
+                    "WHERE symbol=%s ORDER BY run_at DESC LIMIT %s", (symbol.upper(), limit))
+        return [{"id": i, "run_at": ra.isoformat(), "model": m, "cost_usd": cost, "one_line": ol,
+                 **(pl or {})} for i, ra, m, cost, ol, pl in cur.fetchall()]
+
+
+def load_recent(limit: int = 30) -> list[dict]:
+    """Most recent briefs across ALL names (for a global runs feed)."""
+    from .db import get_connection
+    with get_connection() as c, c.cursor() as cur:
+        cur.execute("SELECT id, symbol, run_at, model, cost_usd, one_line FROM analyst_runs "
+                    "ORDER BY run_at DESC LIMIT %s", (limit,))
+        return [{"id": i, "symbol": s, "run_at": ra.isoformat(), "model": m, "cost_usd": cost,
+                 "one_line": ol} for i, s, ra, m, cost, ol in cur.fetchall()]
 
 
 def _deterministic_verdict(f: dict) -> str:
@@ -182,6 +305,309 @@ def _deterministic_verdict(f: dict) -> str:
     if sn.get("label"):
         bits.append(f"{sn['label']} news")
     return "; ".join(bits) + "."
+
+
+# ===================== the DEEP, multi-agent read (bull · bear · sector → judge) =====================
+# The one-line `verdict` above is the fast, cheap read. `deep_analysis` is the "show me everything"
+# read: three specialist agents (bull · bear · sector) reason over the SAME free digest IN PARALLEL,
+# then a judge reconciles them into a structured DeepAnalysis — what's genuinely right/wrong, how the
+# sector bears on the name, and DESCRIPTIVE conditional scenarios. Still bright-line clean: each agent
+# reads the pure numbers, cites a provided figure/headline, never advises and never invents.
+
+class CasePoint(BaseModel):
+    point: str        # the claim, one clause
+    evidence: str     # the specific provided number/headline that backs it
+
+
+class SideCase(BaseModel):
+    summary: str             # one-line framing of this side
+    points: list[CasePoint]  # the cited points (<=5)
+
+
+class SectorRead(BaseModel):
+    sector: str
+    backdrop: str       # how the sector is positioned right now (CONTEXT, not a live feed)
+    company_fit: str    # how THIS name sits within that sector
+    sensitivity: str    # the sector factors it is most exposed to (descriptive)
+
+
+class Scenario(BaseModel):
+    label: str          # e.g. "If demand recovers and margins hold"
+    drivers: list[str]  # the conditions that would have to occur (descriptive, NOT predictions)
+    implication: str    # what the setup would descriptively imply under that scenario
+
+
+class DeepAnalysis(BaseModel):
+    headline: str               # the one-line reconciled read (descriptive)
+    thesis: str                 # 2-4 sentences: what this stock IS right now
+    whats_right: list[str]      # what is genuinely working — each cites a number
+    whats_wrong: list[str]      # what is genuinely concerning — each cites a number
+    sector_context: str         # how the sector backdrop bears on the name (descriptive)
+    quarter_read: str           # the latest quarterly result, explained
+    scenarios: list[Scenario]   # bull / base / bear, descriptive conditionals
+    what_to_watch: list[str]    # concrete factual triggers
+    confidence: str             # high/medium/low + a few words why
+    bottom_line: str            # the honest reconciled read (descriptive)
+
+
+# Shared bright-line clause stitched into every deep prompt — the Prime Directives in prose.
+_DESCRIPTIVE_RULES = (
+    "DESCRIPTIVE only: never say buy/sell/hold and never give a price target or a return forecast. "
+    "Cite a SPECIFIC provided number or headline for every claim. Never invent a number — if "
+    "something has no data, say so plainly. You read the precomputed facts; you do not compute."
+)
+
+BULL_SYSTEM = ("You are the BULL analyst. From the precomputed facts, steelman the strongest HONEST "
+               "bull case — what is genuinely working (growth, margins, momentum, ownership, "
+               f"catalysts). At most 5 points, each citing a provided number/headline. {_DESCRIPTIVE_RULES}")
+
+BEAR_SYSTEM = ("You are the BEAR analyst. From the precomputed facts, steelman the strongest HONEST "
+               "bear case — what is genuinely concerning (deteriorating fundamentals, stretched "
+               "technicals, risk, weak news/ownership). At most 5 points, each citing a provided "
+               f"number/headline. {_DESCRIPTIVE_RULES}")
+
+SECTOR_SYSTEM = ("You are the SECTOR/MACRO analyst. Given the name's sector tag and its own facts "
+                 "(fundamental trend, catalysts, news flow), describe how the SECTOR backdrop bears "
+                 "on this company and which sector factors it is most exposed to. We have NO live "
+                 "sector-index or peer feed — treat any general sector view as CONTEXT, not data, and "
+                 f"say so. {_DESCRIPTIVE_RULES}")
+
+JUDGE_SYSTEM = ("You are the senior analyst writing the final DEEP read on one stock. You are given "
+                "the precomputed facts plus a BULL case, a BEAR case and a SECTOR read from your team. "
+                "Reconcile them honestly into: a thesis (what this stock IS now), what's genuinely "
+                "RIGHT, what's genuinely WRONG, the sector context, the latest quarter, and 2-3 "
+                "DESCRIPTIVE scenarios framed as conditionals ('IF x and y, THEN the setup descriptively "
+                "implies z') — these describe what would have to happen, they are NOT predictions or "
+                f"advice. End with an honest bottom line. {_DESCRIPTIVE_RULES}")
+
+
+def _parse_call(model: str, system: str, user: str, output_format, max_tokens: int = 900):
+    """One structured Claude call → (parsed_output, usage). Raises on failure (the caller decides)."""
+    resp = _get_client().messages.parse(
+        model=model, max_tokens=max_tokens,
+        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": user}],
+        output_format=output_format,
+    )
+    return resp.parsed_output, getattr(resp, "usage", None)
+
+
+def _agg_usage(usages: list) -> dict:
+    """Sum input/output tokens across the multi-agent calls."""
+    it = sum(getattr(u, "input_tokens", 0) or 0 for u in usages if u is not None)
+    ot = sum(getattr(u, "output_tokens", 0) or 0 for u in usages if u is not None)
+    return {"input_tokens": it, "output_tokens": ot}
+
+
+def _case_text(c) -> str:
+    """A SideCase → plain text for the judge prompt (None ⇒ honest 'no data')."""
+    if c is None:
+        return "(no data)"
+    pts = "\n".join(f"  - {p.point} [{p.evidence}]" for p in c.points)
+    return f"{c.summary}\n{pts}"
+
+
+def _sector_text(s) -> str:
+    """A SectorRead → plain text for the judge prompt."""
+    if s is None:
+        return "(no data)"
+    return f"sector={s.sector}\nbackdrop: {s.backdrop}\nfit: {s.company_fit}\nsensitivity: {s.sensitivity}"
+
+
+def _deep_cost(out: dict) -> float:
+    """Total $ for one deep read: the 4 Sonnet calls + (if it ran) the live-news fetch + search fee."""
+    cost = 0.0
+    u = out.get("usage")
+    if u:
+        cost += u.get("input_tokens", 0) / 1e6 * _DEEP_PRICE_IN + u.get("output_tokens", 0) / 1e6 * _DEEP_PRICE_OUT
+    ns = out.get("news_status") or {}
+    if ns.get("fetched"):
+        nu = ns.get("usage")
+        if nu is not None:
+            cost += getattr(nu, "input_tokens", 0) / 1e6 * _PRICE_IN + getattr(nu, "output_tokens", 0) / 1e6 * _PRICE_OUT
+        cost += 0.02
+    return round(cost, 4)
+
+
+def deep_analysis(symbol: str, as_of=None, horizon: str = "annual", live_news: bool = True,
+                  save: bool = True) -> dict:
+    """The deep, multi-agent read: bull · bear · sector specialists (parallel) → judge reconciliation.
+    Descriptive only; degrades to facts (+ a deterministic read) when no API key is set. Persists each
+    run to analyst_runs so it shows in the History tab. Live news/web only for a live read (as_of=None)."""
+    news_status = None
+    if live_news and as_of is None:
+        from .news import refresh_news
+        news_status = refresh_news(symbol)
+    facts = assemble_facts(symbol, as_of, horizon)
+    from .credibility import assess_credibility
+    facts["credibility"] = assess_credibility(symbol, as_of)
+    out: dict = {"symbol": symbol, "facts": facts, "deep": None, "debate": None, "usage": None,
+                 "cost_usd": None, "model": DEEP_MODEL, "news_status": news_status}
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return out                      # facts are complete and free; the UI shows a deterministic read
+
+    digest = _digest(facts)
+    usages: list = []
+    debate: dict = {}
+    try:
+        # 1) three specialists in parallel — independent reads over the same free digest
+        specs = {"bull": (BULL_SYSTEM, SideCase), "bear": (BEAR_SYSTEM, SideCase),
+                 "sector": (SECTOR_SYSTEM, SectorRead)}
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            # generous ceilings — a truncated structured response fails the parse, not just shortens it
+            futs = {ex.submit(_parse_call, DEEP_MODEL, sys_, digest, fmt, 1600): name
+                    for name, (sys_, fmt) in specs.items()}
+            for fut in as_completed(futs):
+                parsed, usage = fut.result()
+                debate[futs[fut]] = parsed
+                usages.append(usage)
+        # 2) the judge reconciles the three reads + the facts into the structured DeepAnalysis. This is
+        # the largest output (10 fields incl. lists + scenarios) — give it room or the JSON gets cut off.
+        judge_input = (f"{digest}\n\nBULL CASE:\n{_case_text(debate.get('bull'))}\n\n"
+                       f"BEAR CASE:\n{_case_text(debate.get('bear'))}\n\n"
+                       f"SECTOR READ:\n{_sector_text(debate.get('sector'))}")
+        deep, usage = _parse_call(DEEP_MODEL, JUDGE_SYSTEM, judge_input, DeepAnalysis, max_tokens=4000)
+        usages.append(usage)
+        out["deep"] = deep
+        out["debate"] = {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in debate.items()}
+    except Exception as e:  # noqa: BLE001 - a failed deep read degrades to facts, never crashes a brief
+        log.warning("deep_analysis failed for %s: %s", symbol, e)
+        return out
+    out["usage"] = _agg_usage(usages)
+    out["cost_usd"] = _deep_cost(out)
+    if save:
+        _save_deep_run(out)
+    return out
+
+
+def _save_deep_run(out: dict) -> None:
+    """Persist one deep read to analyst_runs (payload.deep + payload.debate). Best-effort — a storage
+    hiccup must never break the read. one_line = the headline so the History list stays uniform."""
+    deep = out.get("deep")
+    if deep is None:
+        return
+    dd = deep.model_dump() if hasattr(deep, "model_dump") else deep
+    f = out.get("facts") or {}
+    cred = f.get("credibility") or {}
+    ns = out.get("news_status") or {}
+    payload = _json_safe({
+        "deep": dd,
+        "debate": out.get("debate"),
+        "snapshot": _facts_snapshot(f),
+        "credibility": {"track_record": cred.get("track_record"), "checks": cred.get("checks")} if cred else None,
+        "news": {"fetched": ns.get("fetched"), "n": ns.get("n"), "reason": ns.get("reason")},
+    })
+    try:
+        from psycopg.types.json import Json
+
+        from .db import get_connection
+        with get_connection() as c, c.cursor() as cur:
+            cur.execute(
+                "INSERT INTO analyst_runs (symbol, model, cost_usd, one_line, payload) VALUES (%s,%s,%s,%s,%s)",
+                (out["symbol"], out.get("model") or DEEP_MODEL, out.get("cost_usd"), dd.get("headline"), Json(payload)),
+            )
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not save deep analyst run for %s: %s", out.get("symbol"), e)
+
+
+# ===================== ask-the-analyst: a follow-up over the WHOLE research =====================
+# Distinct from docs.ask (RAG over filings ONLY). This agent sees the assembled facts + the latest
+# deep read + retrieved filing chunks AND may web-search for current developments — so the desk can
+# interrogate the whole research, not just the documents. Descriptive, cited, look-ahead-barred.
+
+_ASK_RESEARCH_SYSTEM = (
+    "You are the TradeOS analyst answering a follow-up question about ONE stock, grounded in the "
+    "RESEARCH provided: precomputed point-in-time facts (technical/fundamental/risk/news/sector/"
+    "ownership), the latest deep read if present, and numbered DOCUMENT EXCERPTS from the company's "
+    "filings/concalls. You MAY use web_search for recent developments when the question needs current "
+    "information, and should say when you did. Cite document excerpts inline as [1], [2] when you rely "
+    "on them. DESCRIPTIVE only: never say buy/sell/hold and never give a price target or return "
+    "forecast. Ground every claim in the provided facts, excerpts or your search results; never invent "
+    "a number — if something is unknown, say so plainly."
+)
+
+
+def _latest_deep_summary(symbol: str) -> str | None:
+    """Most recent persisted deep headline + bottom line, for follow-up context (one cheap DB read)."""
+    try:
+        from .db import get_connection
+        with get_connection() as c, c.cursor() as cur:
+            cur.execute("SELECT payload FROM analyst_runs WHERE symbol=%s AND payload->'deep' IS NOT NULL "
+                        "ORDER BY run_at DESC LIMIT 1", (symbol.upper(),))
+            row = cur.fetchone()
+    except Exception:  # noqa: BLE001 - missing context is fine; the facts digest still grounds the answer
+        return None
+    if not row or not row[0]:
+        return None
+    d = (row[0] or {}).get("deep") or {}
+    bits = [b for b in (d.get("headline"), d.get("bottom_line")) if b]
+    return " — ".join(bits) or None
+
+
+def _web_sources(resp) -> list[dict]:
+    """Extract {title, url} from any web_search_tool_result blocks in a response (best-effort, deduped)."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for b in getattr(resp, "content", []) or []:
+        if getattr(b, "type", None) != "web_search_tool_result":
+            continue
+        for r in (getattr(b, "content", None) or []):
+            url = getattr(r, "url", None)
+            if url and url not in seen:
+                seen.add(url)
+                out.append({"title": getattr(r, "title", None) or url, "url": url})
+    return out
+
+
+def ask_research(symbol: str, question: str, *, as_of=None, allow_web: bool = True,
+                 horizon: str = "annual", k: int = 5) -> dict:
+    """Answer a follow-up about the WHOLE research for one name — grounded in the assembled facts + the
+    latest deep read + retrieved filing chunks (RAG) + (live read only) web_search. Returns
+    {answer, citations, hits, web_used, web_sources, note}. Degrades to retrieved excerpts + a note
+    when no API key is set, exactly like docs.ask."""
+    sym = symbol.upper()
+    from .cache import memo
+    facts = memo(("analyst-facts", sym, str(as_of), horizon),
+                 lambda: assemble_facts(sym, as_of, horizon))   # repeat follow-ups reuse the facts
+    from .docs import _valid_citations, search
+    try:
+        hits = search(sym, question, k)
+    except Exception as e:  # noqa: BLE001 - no docs/embeddings shouldn't block a facts-only answer
+        log.warning("doc search failed for %s: %s", sym, e)
+        hits = []
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return {"answer": None, "citations": [], "hits": hits, "web_used": False, "web_sources": [],
+                "note": "No ANTHROPIC_API_KEY — showing retrieved excerpts only."}
+
+    deep_summary = _latest_deep_summary(sym)
+    excerpts = "\n\n".join(f"[{i + 1}] (source: {h['source']})\n{h['content']}" for i, h in enumerate(hits))
+    parts = [f"RESEARCH (point-in-time facts):\n{_digest(facts)}"]
+    if deep_summary:
+        parts.append(f"LATEST DEEP READ: {deep_summary}")
+    parts.append("DOCUMENT EXCERPTS:\n" + (excerpts or "(no filings ingested for this name)"))
+    parts.append(f"QUESTION: {question}")
+
+    use_web = bool(allow_web and as_of is None)   # searching 'today' for a past as_of would leak the future
+    kwargs: dict = {
+        "model": CLAUDE_MODEL, "max_tokens": 1100,
+        "system": [{"type": "text", "text": _ASK_RESEARCH_SYSTEM, "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": "\n\n".join(parts)}],
+    }
+    if use_web:
+        kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+    try:
+        resp = _get_client().messages.create(**kwargs)
+    except Exception as e:  # noqa: BLE001 - a failed answer still returns the retrieved evidence
+        log.warning("ask_research failed for %s: %s", sym, e)
+        return {"answer": None, "citations": [], "hits": hits, "web_used": False, "web_sources": [],
+                "note": f"Answer failed: {str(e)[:80]}. Showing retrieved excerpts."}
+    answer = "".join(getattr(b, "text", "") for b in resp.content
+                     if getattr(b, "type", None) == "text").strip()
+    web_sources = _web_sources(resp)
+    cited = _valid_citations([int(m) for m in re.findall(r"\[(\d+)\]", answer)], len(hits))
+    return {"answer": answer or None, "citations": cited, "hits": hits,
+            "web_used": bool(web_sources), "web_sources": web_sources, "note": None}
 
 
 # ----------------------------------- CLI -----------------------------------
@@ -247,6 +673,16 @@ def _print(out: dict) -> None:
     drv = ("  — " + "; ".join(att["drivers"])) if att.get("drivers") else ""
     print(f"    attention {_fmt(att.get('score'))}/100{drv} · read-confidence {_fmt(conf.get('level'))}")
 
+    cred = f.get("credibility")
+    if cred:
+        _section("MANAGEMENT CREDIBILITY (guidance → delivered)")
+        print(f"    {_fmt(cred.get('track_record'))}")
+        for ch in (cred.get("checks") or [])[:5]:
+            print(f"      • [{ch.get('verdict')}] {ch.get('period')}: promised {ch.get('promised')} "
+                  f"→ actual {ch.get('actual')}")
+        if cred.get("caveat"):
+            print(f"      caveat: {cred['caveat']}")
+
     # ----- the small final verdict -----
     print(f"\n{'='*78}\n  FINAL VERDICT\n{'='*78}")
     v = out["verdict"]
@@ -259,22 +695,87 @@ def _print(out: dict) -> None:
     print("  BEAR:  " + " | ".join(v.bear))
     print("  WATCH: " + " | ".join(v.watch))
     print(f"  confidence: {v.confidence}")
+    ns = out.get("news_status") or {}
+    nbits = ""
+    if ns.get("fetched"):
+        nu = ns.get("usage")
+        ni = getattr(nu, "input_tokens", 0) if nu else 0
+        no = getattr(nu, "output_tokens", 0) if nu else 0
+        ncost = ni / 1e6 * _PRICE_IN + no / 1e6 * _PRICE_OUT + 0.02  # +~web-search fee
+        nbits = f"  ·  live news: {ns.get('n')} items, {ni + no} tok +search ~${ncost:.3f}"
+    elif ns.get("reason"):
+        nbits = f"  ·  news: {ns['reason']}"
     u = out.get("usage")
     if u is not None:
         it, ot = getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0)
         cost = it / 1e6 * _PRICE_IN + ot / 1e6 * _PRICE_OUT
-        print(f"\n  [1 {ANALYST_MODEL} call · {it} in + {ot} out tokens · ~${cost:.4f}]")
+        print(f"\n  [verdict: 1 {ANALYST_MODEL} call · {it}+{ot} tok · ~${cost:.4f}{nbits}]")
+
+
+def _print_deep(out: dict) -> None:
+    """Print the deep multi-agent read (bull · bear · sector → judge)."""
+    f = out["facts"]
+    print(f"\n{'='*78}\n  {out['symbol']}   ·   ₹{_fmt(f.get('last_close'))}   ·   "
+          f"{_fmt((f.get('macro') or {}).get('sector'))}   ·   DEEP READ\n{'='*78}")
+    deep = out.get("deep")
+    if not deep:
+        print(f"  ▸ {_deterministic_verdict(f)}  (deterministic — set ANTHROPIC_API_KEY for the deep read)")
+        return
+    dbt = out.get("debate") or {}
+    for side in ("bull", "bear"):
+        c = dbt.get(side) or {}
+        if c.get("points"):
+            _section(f"{side.upper()} AGENT")
+            print(f"    {c.get('summary', '')}")
+            for p in c["points"]:
+                print(f"      • {p.get('point')}  [{p.get('evidence')}]")
+    sec = dbt.get("sector") or {}
+    if sec:
+        _section("SECTOR AGENT")
+        print(f"    backdrop: {_fmt(sec.get('backdrop'))}")
+        print(f"    fit: {_fmt(sec.get('company_fit'))}")
+        print(f"    sensitivity: {_fmt(sec.get('sensitivity'))}")
+
+    print(f"\n{'='*78}\n  JUDGE — DEEP ANALYSIS\n{'='*78}")
+    print(f"  ▸ {deep.headline}\n\n  {deep.thesis}\n")
+    print("  WHAT'S RIGHT:")
+    for x in deep.whats_right:
+        print(f"    + {x}")
+    print("  WHAT'S WRONG:")
+    for x in deep.whats_wrong:
+        print(f"    - {x}")
+    print(f"\n  SECTOR: {deep.sector_context}")
+    print(f"  QUARTER: {deep.quarter_read}\n")
+    for s in deep.scenarios:
+        print(f"  SCENARIO — {s.label}")
+        for d in s.drivers:
+            print(f"      · {d}")
+        print(f"      ⇒ {s.implication}")
+    print("\n  WATCH: " + " | ".join(deep.what_to_watch))
+    print(f"  confidence: {deep.confidence}")
+    print(f"\n  BOTTOM LINE: {deep.bottom_line}")
+    if out.get("cost_usd") is not None:
+        u = out.get("usage") or {}
+        print(f"\n  [deep: 4 {out.get('model')} calls · "
+              f"{u.get('input_tokens', 0)}+{u.get('output_tokens', 0)} tok · ~${out['cost_usd']:.4f}]")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Multi-angle analyst brief (one small verdict) for one name.")
+    ap = argparse.ArgumentParser(description="Multi-angle analyst brief for one name.")
     ap.add_argument("symbol", help="ticker, e.g. RELIANCE.NS")
     ap.add_argument("--as-of", help="point-in-time date YYYY-MM-DD")
     ap.add_argument("--horizon", default="annual")
+    ap.add_argument("--no-live-news", action="store_true", help="skip the live web-news fetch (use cached/none)")
+    ap.add_argument("--deep", action="store_true",
+                    help="run the deep multi-agent read (bull · bear · sector → judge) instead of the one-liner")
     args = ap.parse_args()
     import datetime as dt
     as_of = dt.date.fromisoformat(args.as_of) if args.as_of else None
-    _print(verdict(args.symbol.upper(), as_of=as_of, horizon=args.horizon))
+    sym, hz, live = args.symbol.upper(), args.horizon, not args.no_live_news
+    if args.deep:
+        _print_deep(deep_analysis(sym, as_of=as_of, horizon=hz, live_news=live))
+    else:
+        _print(verdict(sym, as_of=as_of, horizon=hz, live_news=live))
 
 
 if __name__ == "__main__":

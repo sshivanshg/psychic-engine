@@ -71,7 +71,7 @@
       {@const t = c.technical?.dials ?? {}}
       {@const f = c.fundamental?.dials ?? {}}
       {@const a = c.attention ?? {}}
-      <a class="card" href={`/stock/${c.symbol}`}>
+      <a class="card" href={`/analyst/${c.symbol}`}>
         <div class="top">
           <div>
             <div class="sym">{c.symbol.replace('.NS', '')}</div>

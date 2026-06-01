@@ -58,6 +58,28 @@ def _jsonable_analysis(a: dict) -> dict:
     return out
 
 
+def _sanitize(obj):
+    """Recursively coerce engine output to JSON-safe primitives: numpy scalars → python, dates → ISO,
+    Pydantic models → dicts. The analyst fact-base mixes all three (np.float64 risk numbers, date
+    period-ends, the AnalystVerdict model), and FastAPI's default encoder chokes on np.int64."""
+    if obj is None or isinstance(obj, (str, bool, int, float)):
+        return obj
+    if hasattr(obj, "model_dump"):                  # Pydantic model
+        return _sanitize(obj.model_dump())
+    if hasattr(obj, "item") and not isinstance(obj, (list, tuple, dict)):
+        try:
+            return obj.item()                        # numpy scalar
+        except Exception:                            # noqa: BLE001
+            return str(obj)
+    if isinstance(obj, (dt.date, dt.datetime)):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {str(k): _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize(v) for v in obj]
+    return str(obj)
+
+
 def _guard(fn):
     """Run an engine call, mapping the engine's 'no data' RuntimeError to a clean 503."""
     try:
@@ -128,6 +150,129 @@ def stock_series(symbol: str, as_of: str | None = None, lookback: int = Query(40
     if s is None:
         raise HTTPException(status_code=404, detail=f"no price data for {symbol.upper()}")
     return s
+
+
+def _analyst_guard(fn):
+    """Like `_guard`, but the analyst engine signals 'no data for this symbol' with SystemExit
+    (it's a CLI entry too) — map that to a clean 404 instead of letting it kill the worker."""
+    try:
+        return _guard(fn)
+    except SystemExit as e:
+        raise HTTPException(status_code=404, detail=str(e) or "no data for symbol") from e
+
+
+@app.get("/api/analyst/runs")
+def analyst_runs(limit: int = Query(40, ge=1, le=200)) -> dict:
+    """Most recent analyst briefs across ALL names — the global runs feed. Declared BEFORE the
+    /{symbol} route so 'runs' isn't captured as a symbol."""
+    from .analyst import load_recent
+    return {"runs": _sanitize(_guard(lambda: load_recent(limit)))}
+
+
+@app.get("/api/analyst/{symbol}")
+def analyst(symbol: str, horizon: str = "annual", as_of: str | None = None,
+            verdict: bool = False) -> dict:
+    """The multi-angle analyst fact-base for ONE name — every fetched detail (deep technical,
+    fundamental + last-6-quarter trend, raw news headlines, auto-tagged catalysts, ownership,
+    attention/confidence). All deterministic and FREE. `verdict=true` adds the management-credibility
+    read + ONE small Haiku bull/bear/judge call (~$0.0025) — degrades to facts-only without a key.
+    Works on ANY symbol in the DB, held or not (portfolio-relative fields are null for a single name)."""
+    from .analyst import assemble_facts
+    from .analyst import verdict as run_verdict
+    sym = symbol.upper()
+    aod = _parse_as_of(as_of)
+    aod_s = str(aod) if aod else None
+    if not verdict:
+        return _sanitize({"symbol": sym, "as_of": aod_s,
+                          "facts": _analyst_guard(lambda: assemble_facts(sym, aod, horizon)),
+                          "verdict": None, "usage": None})
+    out = _analyst_guard(lambda: run_verdict(sym, aod, horizon))
+    usage = out.get("usage")
+    return _sanitize({
+        "symbol": sym, "as_of": aod_s, "facts": out.get("facts"), "verdict": out.get("verdict"),
+        "usage": ({"input_tokens": getattr(usage, "input_tokens", None),
+                   "output_tokens": getattr(usage, "output_tokens", None)} if usage else None),
+    })
+
+
+@app.get("/api/analyst/{symbol}/deep")
+def analyst_deep(symbol: str, horizon: str = "annual", as_of: str | None = None) -> dict:
+    """The DEEP multi-agent read for ONE name: bull · bear · sector specialists (parallel) → a judge
+    that reconciles into a structured analysis (thesis, what's right/wrong, sector context, descriptive
+    scenarios, bottom line) + the raw agent debate. Opt-in (4 Sonnet calls, ~$0.05–0.10) — degrades to
+    facts-only without a key. Descriptive: it explains what's right/wrong, it never advises."""
+    from .analyst import deep_analysis
+    sym = symbol.upper()
+    aod = _parse_as_of(as_of)
+    out = _analyst_guard(lambda: deep_analysis(sym, aod, horizon))
+    return _sanitize({
+        "symbol": sym, "as_of": str(aod) if aod else None, "facts": out.get("facts"),
+        "deep": out.get("deep"), "debate": out.get("debate"), "usage": out.get("usage"),
+        "cost_usd": out.get("cost_usd"), "model": out.get("model"),
+    })
+
+
+@app.get("/api/analyst/{symbol}/history")
+def analyst_history(symbol: str, limit: int = Query(20, ge=1, le=100)) -> dict:
+    """Past analyst briefs for one name (newest first): each run's verdict + dial snapshot + cost.
+    Every `verdict=true` call persists one (analyst_runs); this lists them so the desk can see how the
+    read / credibility / news evolved over time, and review old briefs without re-paying for a run."""
+    from .analyst import load_history
+    sym = symbol.upper()
+    return {"symbol": sym, "runs": _sanitize(_guard(lambda: load_history(sym, limit)))}
+
+
+@app.get("/api/stock/{symbol}/news")
+def stock_news(symbol: str, as_of: str | None = None,
+               limit: int = Query(60, ge=1, le=300)) -> dict:
+    """Raw fetched headlines for one name (title · publisher · date · polarity) + the catalyst tag
+    per headline + the news-flow summary. Snapshot · eval-barred (descriptive-of-now). Free."""
+    from .events import classify_event
+    from .sentiment import compute_sentiment, load_headlines
+    sym = symbol.upper()
+    aod = _parse_as_of(as_of)
+    heads = _guard(lambda: load_headlines([sym], aod, limit_per=limit)).get(sym, [])
+    for h in heads:
+        h["event"] = classify_event(h.get("title"))
+    summary = compute_sentiment(sym, aod, articles=[{"polarity": h["polarity"]}
+                                                     for h in heads if h.get("polarity") is not None])
+    return _sanitize({"symbol": sym, "as_of": str(aod) if aod else None,
+                      "headlines": heads, "summary": summary})
+
+
+@app.get("/api/stock/{symbol}/docs")
+def stock_docs(symbol: str) -> dict:
+    """The ingested RAG corpus for one name — one row per document (source, period, filing date,
+    URL, chunk count). Lets the desk see exactly what the 'ask the call' answers are grounded in."""
+    from .docs import list_documents
+    sym = symbol.upper()
+    return {"symbol": sym, "documents": _guard(lambda: list_documents(sym))}
+
+
+@app.get("/api/news")
+def news(as_of: str | None = None, limit: int = Query(200, ge=1, le=1000)) -> dict:
+    """Portfolio-wide newsroom: every fetched headline across all holdings, newest-first, each
+    tagged with its symbol + catalyst category. Snapshot · eval-barred. Free."""
+    from .config import _safe_load, load_universe
+    from .events import classify_event
+    from .sentiment import load_headlines
+    syms = [p.symbol for p in _safe_load()] or load_universe()   # degrade to universe on an empty book
+    aod = _parse_as_of(as_of)
+    by_sym = _guard(lambda: load_headlines(syms, aod, limit_per=None)) if syms else {}
+    flat = [{**h, "symbol": s, "event": classify_event(h.get("title"))}
+            for s, hs in by_sym.items() for h in hs]
+    # newest first; rows without a date sink to the bottom (empty string sorts before any ISO date)
+    flat.sort(key=lambda h: h.get("published") or "", reverse=True)
+    return _sanitize({"as_of": str(aod) if aod else None, "count": len(flat),
+                      "headlines": flat[:limit]})
+
+
+@app.get("/api/coverage")
+def coverage() -> dict:
+    """Data-coverage matrix — what's actually been fetched per holding across every table
+    (prices · fundamentals · news · ownership · docs) + freshness. The desk's blind-spot map."""
+    from .coverage import data_coverage
+    return {"rows": _guard(data_coverage)}
 
 
 @app.get("/api/risk")
@@ -229,6 +374,25 @@ class AskRequest(BaseModel):
 def ask(req: AskRequest) -> dict:
     from .docs import ask as rag_ask
     return _guard(lambda: rag_ask(req.symbol, req.question))
+
+
+class AnalystAskRequest(BaseModel):
+    symbol: str
+    question: str
+    web: bool = True                 # allow the live web_search tool (live reads only)
+    as_of: str | None = None
+
+
+@app.post("/api/analyst/ask")
+def analyst_ask(req: AnalystAskRequest) -> dict:
+    """Ask the analyst a FOLLOW-UP over the whole research for one name — grounded in the assembled
+    facts + the latest deep read + retrieved filing chunks (RAG) + (live only) web_search. Distinct
+    from /api/ask (which is RAG over filings only). Descriptive, cited; degrades to excerpts + a note
+    without a key. Web search is barred for a historical as_of (look-ahead)."""
+    from .analyst import ask_research
+    aod = _parse_as_of(req.as_of)
+    return _sanitize(_analyst_guard(
+        lambda: ask_research(req.symbol, req.question, as_of=aod, allow_web=req.web)))
 
 
 # ----------------------------------------------------------------------------------------------

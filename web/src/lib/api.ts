@@ -49,9 +49,24 @@ export const api = {
     get(`/api/stock/${encodeURIComponent(sym)}?narrate=${narrate}`),
   stockSeries: (sym: string, lookback = 400) =>
     get(`/api/stock/${encodeURIComponent(sym)}/series?lookback=${lookback}`),
-  evalSignals: (horizon = 21) => get(`/api/eval?horizon=${horizon}`),
   briefing: () => get('/api/briefing'),
   docsStatus: () => get('/api/docs/status'),
+
+  // --- evidence layer: every fetched detail per name + portfolio-wide ---
+  analyst: (sym: string, horizon = 'annual') =>
+    get(`/api/analyst/${encodeURIComponent(sym)}?verdict=false&horizon=${encodeURIComponent(horizon)}`),
+  analystVerdict: (sym: string, horizon = 'annual') =>
+    get(`/api/analyst/${encodeURIComponent(sym)}?verdict=true&horizon=${encodeURIComponent(horizon)}`),
+  analystDeep: (sym: string, horizon = 'annual') =>
+    get(`/api/analyst/${encodeURIComponent(sym)}/deep?horizon=${encodeURIComponent(horizon)}`),
+  analystHistory: (sym: string, limit = 20) =>
+    get(`/api/analyst/${encodeURIComponent(sym)}/history?limit=${limit}`),
+  analystRuns: (limit = 40) => get(`/api/analyst/runs?limit=${limit}`),
+  stockNews: (sym: string, limit = 60) =>
+    get(`/api/stock/${encodeURIComponent(sym)}/news?limit=${limit}`),
+  stockDocs: (sym: string) => get(`/api/stock/${encodeURIComponent(sym)}/docs`),
+  news: (limit = 200) => get(`/api/news?limit=${limit}`),
+  coverage: () => get('/api/coverage'),
 
   // --- write seam ---
   addHolding: (h: HoldingInput) => send('/api/holdings', 'POST', h),
@@ -72,6 +87,11 @@ export const api = {
 
   async ask(symbol: string, question: string) {
     return send('/api/ask', 'POST', { symbol, question });
+  },
+
+  // ask the analyst a follow-up over the WHOLE research (facts + deep read + filings + live web)
+  async askResearch(symbol: string, question: string, web = true) {
+    return send('/api/analyst/ask', 'POST', { symbol, question, web });
   },
 
   // --- live reasoning monitor (SSE) ---

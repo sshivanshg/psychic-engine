@@ -140,3 +140,17 @@ CREATE TABLE IF NOT EXISTS price_vintages (
     PRIMARY KEY (symbol, date, vintage_date)
 );
 CREATE INDEX IF NOT EXISTS idx_price_vintages_lookup ON price_vintages (symbol, date, vintage_date DESC);
+
+-- Analyst-brief history — each verdict run (CLI `tradeos.analyst` or the verdict API) persists its AI
+-- verdict + a compact facts snapshot + cost here, so the dashboard can show PAST briefs for a name
+-- (how the read / credibility / news changed over time) and review them without re-paying for a run.
+CREATE TABLE IF NOT EXISTS analyst_runs (
+    id       bigserial   PRIMARY KEY,
+    symbol   text        NOT NULL,
+    run_at   timestamptz NOT NULL DEFAULT now(),
+    model    text,
+    cost_usd double precision,
+    one_line text,
+    payload  jsonb       NOT NULL          -- {verdict, snapshot (dials), credibility, news_status}
+);
+CREATE INDEX IF NOT EXISTS idx_analyst_runs_symbol_runat ON analyst_runs (symbol, run_at DESC);

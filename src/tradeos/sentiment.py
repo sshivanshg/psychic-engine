@@ -63,6 +63,39 @@ def load_sentiment(symbols, as_of=None) -> dict:
     return out
 
 
+def load_headlines(symbols, as_of=None, *, limit_per: int | None = 60) -> dict[str, list[dict]]:
+    """{symbol: [{title, publisher, published, polarity}]} newest-first — the RAW headlines for the
+    news UI. The analyzer only needs the polarity (`load_sentiment`); this carries the human-readable
+    title/publisher for display. Point-in-time: with `as_of`, only headlines published on/before it
+    (rows with no timestamp are dropped, exactly like `load_sentiment` — an honest gap, never invented).
+    Without `as_of` we keep untimestamped rows too (NULLS last) so a fresh snapshot still shows up.
+
+    NOTE (Prime Directive #2/#8): like the sentiment dial, this is a CURRENT snapshot — descriptive,
+    not reconstructable point-in-time — so the UI must badge it `snapshot · eval-barred`."""
+    syms = list(symbols)
+    if not syms:
+        return {}
+    ph = ",".join(["%s"] * len(syms))
+    sql = f"SELECT symbol, title, publisher, published, polarity FROM sentiment WHERE symbol IN ({ph})"
+    params: list = list(syms)
+    if as_of is not None:
+        cutoff = as_of if isinstance(as_of, dt.date) else dt.date.fromisoformat(str(as_of)[:10])
+        sql += " AND published IS NOT NULL AND published <= %s"
+        params.append(cutoff)
+    sql += " ORDER BY symbol, published DESC NULLS LAST"
+    out: dict[str, list[dict]] = {s: [] for s in syms}
+    with get_connection() as c, c.cursor() as cur:
+        cur.execute(sql, params)
+        for sym, title, publisher, published, polarity in cur.fetchall():
+            bucket = out.setdefault(sym, [])
+            if limit_per is not None and len(bucket) >= limit_per:
+                continue
+            bucket.append({"title": title, "publisher": publisher,
+                           "published": str(published)[:10] if published else None,
+                           "polarity": round(float(polarity), 3) if polarity is not None else None})
+    return out
+
+
 def compute_sentiment(symbol: str, as_of=None, *, articles=None) -> dict | None:
     arts = load_sentiment([symbol], as_of).get(symbol, []) if articles is None else articles
     if not arts:

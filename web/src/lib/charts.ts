@@ -199,26 +199,86 @@ export function returnsBarOption(card: any) {
   };
 }
 
-// --- signal eval: IC per signal, coloured by significance ---------------------------------
-export function icBarOption(signals: Record<string, any>) {
+// --- quarterly results: revenue bars + net-margin line (dual axis) ------------------------
+export function quarterlyTrendOption(rows: any[]) {
   const p = getPalette();
   const { tooltip, axisLabel, axisLine, splitLine, baseGrid } = base(p);
-  const rows = Object.entries(signals)
-    .map(([name, s]) => ({ name, ic: s.ic, t: s.t_stat, kind: s.kind }))
-    .filter((r) => r.ic != null);
+  const qs = rows.map((r) => (r.q ?? '').slice(0, 7));
+  // revenue is in reporting currency (often huge) — scale to crore (÷1e7) for a readable axis
+  const rev = rows.map((r) => (r.revenue != null ? +(r.revenue / 1e7).toFixed(1) : null));
+  const margin = rows.map((r) => r.net_margin_pct);
   return {
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltip,
-               formatter: (ps: any) => {
-                 const r = rows[ps[0].dataIndex];
-                 return `${r.name} (${r.kind})<br/>IC ${r.ic}<br/>t ${r.t ?? '—'}`;
-               } },
-    grid: { ...baseGrid, left: 110 },
-    xAxis: { type: 'value', axisLabel, splitLine, axisLine: { show: false } },
-    yAxis: { type: 'category', data: rows.map((r) => r.name), axisLabel, axisLine, axisTick: { show: false } },
+    tooltip: {
+      trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltip,
+      formatter: (ps: any[]) => {
+        const i = ps[0].dataIndex;
+        return `${rows[i].q}<br/>revenue ₹${rev[i] ?? '—'} cr<br/>net margin ${margin[i] ?? '—'}%`;
+      }
+    },
+    legend: { top: 0, textStyle: { color: p.muted, fontSize: 11 }, data: ['Revenue (₹cr)', 'Net margin %'] },
+    grid: { ...baseGrid, left: 60, right: 50, top: 30 },
+    xAxis: { type: 'category', data: qs, axisLabel, axisLine, axisTick: { show: false } },
+    yAxis: [
+      { type: 'value', axisLabel, splitLine, axisLine: { show: false } },
+      { type: 'value', axisLabel: { ...axisLabel, formatter: '{value}%' }, splitLine: { show: false }, axisLine: { show: false } }
+    ],
+    series: [
+      { name: 'Revenue (₹cr)', type: 'bar', data: rev, barWidth: '46%',
+        itemStyle: { color: p.accent, borderRadius: [3, 3, 0, 0] } },
+      { name: 'Net margin %', type: 'line', yAxisIndex: 1, data: margin, smooth: true,
+        showSymbol: true, symbolSize: 6, lineStyle: { color: p.warn, width: 2 },
+        itemStyle: { color: p.warn } }
+    ]
+  };
+}
+
+// --- ownership split donut: institutional / insider / public float ------------------------
+export function ownershipDonutOption(own: any) {
+  const p = getPalette();
+  const { tooltip } = base(p);
+  const inst = own?.institutional_pct ?? 0;
+  const insider = own?.insider_pct ?? 0;
+  const pub = Math.max(0, +(100 - inst - insider).toFixed(1));
+  return {
+    color: [p.accent, p.purple, p.grid],
+    tooltip: { trigger: 'item', ...tooltip, valueFormatter: (v: number) => `${v?.toFixed(1)}%` },
+    legend: { bottom: 0, textStyle: { color: p.muted, fontSize: 11 } },
     series: [{
-      type: 'bar', barWidth: 13,
-      data: rows.map((r) => ({ value: r.ic,
-        itemStyle: { color: Math.abs(r.t ?? 0) >= 2 ? p.warn : p.accent, borderRadius: 3 } }))
+      type: 'pie', radius: ['54%', '80%'], center: ['50%', '44%'], avoidLabelOverlap: true,
+      itemStyle: { borderColor: p.panel, borderWidth: 2 },
+      label: { show: false }, labelLine: { show: false },
+      data: [
+        { name: 'Institutional', value: inst },
+        { name: 'Insider', value: insider },
+        { name: 'Public float', value: pub }
+      ]
+    }]
+  };
+}
+
+// --- news polarity over time: per-headline bars, green/red by sign ------------------------
+export function polarityTimelineOption(headlines: any[]) {
+  const p = getPalette();
+  const { tooltip, axisLabel, axisLine, splitLine, baseGrid } = base(p);
+  const rows = headlines
+    .filter((h) => h.published && h.polarity != null)
+    .slice()
+    .sort((a, b) => (a.published < b.published ? -1 : 1));
+  return {
+    tooltip: {
+      ...tooltip, trigger: 'axis', axisPointer: { type: 'shadow' },
+      formatter: (ps: any[]) => {
+        const h = rows[ps[0].dataIndex];
+        return `${h.published}<br/>${(h.title ?? '').slice(0, 64)}…<br/>polarity ${h.polarity}`;
+      }
+    },
+    grid: { ...baseGrid, left: 40, top: 16 },
+    xAxis: { type: 'category', data: rows.map((h) => h.published), axisLabel, axisLine, axisTick: { show: false } },
+    yAxis: { type: 'value', min: -1, max: 1, axisLabel, splitLine, axisLine: { show: false } },
+    series: [{
+      type: 'bar', data: rows.map((h) => ({ value: h.polarity,
+        itemStyle: { color: h.polarity > 0 ? p.good : h.polarity < 0 ? p.bad : p.muted, borderRadius: 2 } })),
+      barWidth: rows.length > 30 ? '60%' : 10
     }]
   };
 }

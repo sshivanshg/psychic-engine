@@ -46,7 +46,7 @@
     {#each data.flagged as stock}
       <div class="panel">
         <div class="panel-h">
-          <a class="sym" href={`/stock/${stock.symbol}`} style="font-weight:700">{stock.symbol.replace('.NS', '')}</a>
+          <a class="sym" href={`/analyst/${stock.symbol}`} style="font-weight:700">{stock.symbol.replace('.NS', '')}</a>
           <span class="muted mono">attention {num(stock.attention, 0)} · confidence {stock.confidence ?? '—'}</span>
         </div>
         <ul>{#each stock.alerts as a}<li class="alert">{a}</li>{/each}</ul>

@@ -1,40 +1,71 @@
 # TradeOS
 
-A scheduled, **multi-agent equity-analysis system** that runs on a real Indian-equity portfolio.
-Six pure analyzers (risk · technical · fundamental · macro/sector · sentiment · ownership) feed a
-hand-built orchestrator that produces, per holding: categorical dials, a decomposable **attention
-score**, a **calibrated confidence**, a run-over-run **what-changed delta**, and an optional LLM
-reasoning trace. A point-in-time **eval harness** measures whether the signals actually predict
-forward returns (cross-sectional IC, Newey-West HAC t-stats, net-of-cost spreads). A thin FastAPI
-read layer + a SvelteKit dashboard sit on top.
+A **multi-angle equity sense-making system** that runs on real Indian-equity data. You give it a stock;
+it pulls **every angle** — deep technicals, fundamentals + a quarterly-results trend, live web news with
+auto-tagged catalysts, ownership, risk, and (when you've fed it concalls) a **management-credibility
+read** — then a final AI agent weighs the bull and bear and writes a **small, honest verdict**.
 
-**Three bright lines the whole system honors:**
-- **Descriptive, never prescriptive** — it explains risk/technicals/fundamentals; it never says buy/sell/hold.
-- **Point-in-time** — analysis for `(symbol, as_of)` uses only data known by `as_of` (fundamentals apply an announcement lag).
-- **Honest** — missing data → `None`/"no data"; a confidently-wrong number is treated as worse than no number.
+It is built around one idea most "AI trading" tools get wrong:
 
-> Personal learning project + hireable showcase. Free public data only (yfinance). The quant core is
-> pure/deterministic; the LLM layer is optional and degrades to "numbers only" without an API key.
+> **Sense-making, not forecasting.** Reading and reconciling the whole information surface of a company
+> is what LLMs are genuinely good at. *Predicting prices is not* — and this repo proves it: the eval
+> harness, run on 106 NSE names over 10 years, finds **no simple signal with bankable, cost-surviving
+> edge**. So TradeOS never tells you to buy or sell. It explains; **you make the call.**
+
+Three bright lines the whole system honors:
+- **Descriptive, never prescriptive** — it explains risk/technicals/fundamentals/news; never buy/sell/hold (SEBI).
+- **Point-in-time** — analysis for `(symbol, as_of)` uses only data known by `as_of`; live web news is fetched only for a *live* read, never for a historical replay (that would be look-ahead).
+- **Honest** — missing data → `None`/"no data"; a confidently-wrong number is treated as worse than no number; every number is traceable to its inputs and `as_of`.
+
+> Personal learning project + hireable showcase. Free/cheap data only (yfinance + the agent's own web search).
+
+---
+
+## What you actually get
+
+**1. The Analyst Engine — `python -m tradeos.analyst SYMBOL`** *(the headline)*
+One symbol in → every fetched detail (free, deterministic) → one small AI verdict:
+
+```
+EPIGRAL.NS  →  TECHNICAL (trend/RSI/MACD/SMA/returns/52w) · FUNDAMENTAL + last-6-quarter trend ·
+               LIVE NEWS + auto-tagged catalysts · OWNERSHIP · RISK (vol/β) · attention/confidence ·
+               MANAGEMENT CREDIBILITY (guidance → delivered)
+            →  FINAL VERDICT: one-liner · bull · bear · watch · confidence
+```
+Every brief is **journaled** (`analyst_runs`) so the dashboard can show past briefs and how the read evolved.
+
+**2. Portfolio risk + an honest signal eval** — a desk-grade risk engine (EWMA covariance, VaR/CVaR,
+component risk, limits) and a backtest harness that *measures* whether signals predict forward returns
+(cross-sectional IC, Newey-West HAC t-stats, net-of-cost spreads, multiple-testing deflation) — and
+reports the uncertainty so the number can't quietly lie to you.
+
+**3. A SvelteKit dashboard** — per-stock analyst workbench (with a History tab), a global Briefs feed,
+portfolio overview, a live multi-agent Reasoning Monitor, newsroom, and data-coverage map.
 
 ---
 
 ## Architecture at a glance
 
 ```
-ingest (yfinance, RAG docs)
-      │
+ingest (yfinance prices · fundamentals · sector · ownership)        concalls → docs.py (RAG, pgvector)
+      │                                                                   │
+      ▼                                                                   ▼
+Postgres + pgvector   prices · price_vintages · fundamentals · security_meta · doc_chunks ·
+      │               guidance · sentiment(live news) · ownership · run_snapshots · analyst_runs
       ▼
-Postgres + pgvector   prices · price_vintages · fundamentals · security_meta ·
-      │               doc_chunks · guidance · sentiment · ownership · run_snapshots
-      ▼
-AnalysisContext  ── loads everything ONCE, point-in-time ──┐
-      ▼                                                     │
-6 pure agents (REGISTRY) ──► orchestrator ──► per-stock cards (dials + attention +
-      │                                        confidence + delta) ──► optional Claude synthesis
-      ▼
-eval.py (backtest)   ·   api.py (FastAPI read layer) ──► web/ (SvelteKit dashboard)
-                                       └─ cache.py memoises factual reads; db.py pools connections
+┌─ Analyst engine (analyst.py) ── per symbol ──────────────────────────────────────────────┐
+│   assemble_facts (6 pure analyzers, free)  +  events.py (catalyst tags)  +  quarterly trend │
+│   +  news.py (LIVE web search, cached)      +  credibility.py (guidance→delivered)           │
+│   →  ONE small Haiku verdict (bull/bear/judge)  →  saved to analyst_runs                      │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+      │                                         │
+      ▼                                         ▼
+eval.py (backtest: IC/Newey-West/net-of-cost)   api.py (FastAPI read+write layer) ──► web/ (SvelteKit)
+risk.py (EWMA cov · VaR · component risk · limits)        research/ (ERC sizer · sector-neutral eval)
 ```
+
+The **quant core is pure/deterministic** (no network, no `datetime.now()` in compute). The **LLM layer
+is separate, optional, and degrades** to "numbers only" without an API key.
 
 ---
 
@@ -42,220 +73,221 @@ eval.py (backtest)   ·   api.py (FastAPI read layer) ──► web/ (SvelteKit 
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **Python 3.12** | pinned in `.python-version` (uv fetches it) | via uv |
+| **Python 3.12** | pinned in `.python-version` | via `uv` |
 | **`uv`** | env + lockfile + scripts | https://docs.astral.sh/uv/ |
-| **PostgreSQL 14+** with **pgvector** | the data layer (pgvector backs RAG) | Homebrew (below) or Docker |
+| **PostgreSQL 14+** with **pgvector** | the data layer (pgvector backs RAG) | Homebrew (below) |
 | **Node 18+ / npm** | only for the `web/` dashboard | https://nodejs.org |
-| **`ANTHROPIC_API_KEY`** | *optional* — LLM narration + RAG answers | https://console.anthropic.com |
+| **`ANTHROPIC_API_KEY`** | the AI verdict, credibility, live web news, RAG answers | https://console.anthropic.com |
 
-Without an API key everything still runs — you get all the numbers, just no Claude-written prose.
+Without a key everything deterministic still runs — you get all the numbers and a dial-based verdict,
+just no AI synthesis / live news / credibility.
 
 ---
 
 ## 2. Setup
 
 ```bash
-# 2.1 — install Python deps (creates .venv/, fetches Python 3.12, writes uv.lock)
-uv sync
+uv sync                                        # env + deps (fetches Python 3.12, writes uv.lock)
 
-# 2.2 — Postgres + pgvector (Homebrew — the canonical local setup)
-brew install postgresql@16 pgvector
+brew install postgresql@16 pgvector            # the canonical local DB
 brew services start postgresql@16
 createdb tradeos
-#   (if your role differs, set DATABASE_URL in .env — see the env table below)
+psql -d tradeos -f db/init/01_init.sql         # idempotent: tables + vector extension + indexes
 
-# 2.3 — apply the schema (idempotent: creates tables, the vector extension, indexes)
-psql -d tradeos -f db/init/01_init.sql
+cp .env.example .env                           # then add ANTHROPIC_API_KEY (and DATABASE_URL if your role differs)
 
-# 2.4 — config (optional): copy the template and edit only what you need
-cp .env.example .env          # then add ANTHROPIC_API_KEY / change DATABASE_URL if needed
-
-# 2.5 — your portfolio: add holdings (see CLI below) or edit holdings.csv directly
-uv run tradeos add RELIANCE.NS 10 2400
+uv run tradeos add RELIANCE.NS 10 2400         # add a holding (fetches its data); or edit holdings.csv
 ```
 
-**Docker alternative for the DB** (instead of 2.2): `docker compose up -d` brings up Postgres on
-`localhost:5432` with creds `tradeos/tradeos`. Note the bundled image is TimescaleDB — make sure the
-`vector` extension is available before `psql -f db/init/01_init.sql`, or RAG (`docs`/`ask`) won't work.
-
-**Your portfolio file (`holdings.csv`)** — columns `symbol,quantity,avg_cost` (avg_cost optional,
-unlocks unrealized P&L). NSE tickers end in `.NS`, BSE in `.BO`. Keep it **private** — it's your real
-book and is git-ignored. `holdings.example.csv` is a reference template.
+`holdings.csv` (columns `symbol,quantity,avg_cost`, avg_cost optional) is **your real book** — git-ignored.
+NSE tickers end in `.NS`, BSE in `.BO`.
 
 ---
 
-## 3. Quick start (first analysis in 3 commands)
+## 3. Quick start
 
 ```bash
-uv run tradeos ingest                 # pull ~2y daily prices + fundamentals + meta for your book
-uv run tradeos risk --no-llm          # portfolio risk read (numbers only, no key needed)
-uv run tradeos analyze --no-llm       # per-stock cards: dials + attention + confidence + delta
+# A — analyse ANY stock (held or not). Pulls every angle + a small AI verdict.
+uv run tradeos ingest                          # prices + fundamentals for your book ∪ universe.csv
+uv run python -m tradeos.analyst RELIANCE.NS    # full detail + live-news + verdict  (~$0.05 first run, ~$0.003 cached)
+uv run python -m tradeos.analyst RELIANCE.NS --no-live-news   # skip the web search (deterministic + verdict only)
+
+# B — portfolio risk + the honest signal eval
+uv run tradeos risk --no-llm                    # EWMA vol, beta, VaR/CVaR, component risk, limit checks
+uv run tradeos eval                             # do the signals predict returns? (IC, Newey-West t, net spread)
 ```
 
-Add `ANTHROPIC_API_KEY` to your `.env`, drop `--no-llm`, and the same commands add Claude's
-descriptive synthesis on top.
+---
+
+## 4. The analyst engine in depth
+
+### What feeds a brief (and what it costs)
+
+| Angle | Source | Cost |
+|------|--------|------|
+| Technical · fundamental · quarterly-results trend · risk · ownership · attention/confidence | the 6 pure analyzers over one point-in-time data load | **free** |
+| **Catalysts** | `events.py` — keyword classifier tags each headline (results / legal / deal / rating / management / capex / …) | **free** |
+| **Live news** | `news.py` — the agent **web-searches** for recent news, scores + stores it in `sentiment` | ~**$0.05** per fresh fetch, then **cached 24h** |
+| **Management credibility** | `credibility.py` — pairs stored concall guidance with the actual results that followed → delivered/partial/missed/too-early | ~**$0.004**, only when a concall is ingested |
+| **Final verdict** | ONE small `claude-haiku-4-5` call: steelman bull + bear, reconcile | ~**$0.003** |
+
+So a **first** brief on a name ≈ **$0.05** (the web search dominates); **repeat** briefs within 24h reuse
+the cached news ≈ **$0.003**. The cost line is printed under every brief, e.g.
+`[verdict: 1 call · 892+419 tok · ~$0.0030 · live news: 5 items, 23679 tok +search ~$0.046]`.
+
+### Model choice (cost vs precision)
+The engine defaults to **Haiku** (cheap, fast). Haiku occasionally mis-states a number — for a
+decision-grade brief, run with the precise model:
+```bash
+ANALYST_MODEL=claude-sonnet-4-6 uv run python -m tradeos.analyst SYMBOL
+```
+
+### Management credibility — activate it
+Credibility needs the **concall transcript** (not the results filing). Ingest one, extract guidance, re-run:
+```bash
+uv run tradeos docs add SYMBOL transcript.pdf   # parse → chunk → embed (local, free)
+uv run tradeos extract SYMBOL                    # RAG-extract management guidance → guidance table
+uv run python -m tradeos.analyst SYMBOL          # the brief now scores guidance → delivered
+```
+Free transcripts: screener.in → the stock → **Concalls** → *Transcript*.
+
+### Past briefs (history)
+Every verdict run is saved. See them in the dashboard: **`/analyst/SYMBOL` → History tab** (per name), or
+**`/runs`** (the global Briefs feed, all names). The history is a true journal — it shows each brief *as it
+was*, with no re-fetch and no re-spend.
 
 ---
 
-## 4. Full CLI reference
+## 5. CLI reference
 
-Run everything via `uv run tradeos <command>`. `uv run tradeos --help` (or `<command> --help`) prints usage.
+Run everything via `uv run tradeos <command>` (`--help` on any command).
 
-### Portfolio management
 | Command | What it does |
 |---------|--------------|
-| `tradeos add SYMBOL QTY [AVG_COST]` | add/update a holding **and fetch its data**. `--no-fetch` to skip the fetch. |
-| `tradeos remove SYMBOL` | remove a holding |
-| `tradeos holdings` | list your portfolio |
+| `tradeos add SYMBOL QTY [AVG_COST]` · `remove SYMBOL` · `holdings` | manage your book (`add` also fetches data) |
+| `tradeos ingest` | refresh prices + fundamentals + sector + ownership for holdings ∪ `universe.csv` (+ benchmark). Idempotent. *(news is no longer pre-ingested — it's fetched live per brief)* |
+| `tradeos check` | DB row counts + date ranges per ticker |
+| `tradeos risk [--horizon d/w/m/q/y\|N] [--as-of …] [--no-llm]` | portfolio risk: EWMA vol, beta, VaR/CVaR (hist + FHS), component risk %, liquidity, limits |
+| `tradeos analyze [--horizon …] [--as-of …] [--no-llm] [--no-snapshot]` | the multi-agent per-stock cards (6 dims + attention + confidence + what-changed delta) |
+| `tradeos briefing [--horizon …] [--as-of …]` | pre-market summary + alert rules |
+| **`python -m tradeos.analyst SYMBOL [--as-of …] [--no-live-news]`** | **the analyst engine** — full detail + live news + AI verdict for one name |
+| `tradeos docs add SYMBOL FILE [--period …] [--filing-date …]` · `docs list` · `docs status` | RAG corpus (concalls/results) |
+| `tradeos ask SYMBOL "QUESTION"` | RAG answer over that name's docs, with citations |
+| `tradeos extract SYMBOL` | extract structured concall guidance → feeds Fundamental + credibility |
+| `tradeos eval [--horizon N] [--step N]` | does each signal predict forward returns? IC · ICIR · Newey-West t · net-of-cost spread · Bonferroni |
+| `tradeos rag-eval [--k N]` | RAG retrieval quality vs a golden set |
+| `tradeos serve [--host … --port …]` | run the FastAPI backend (docs at `/docs`; serves the built SPA if present) |
 
-### Data
-| Command | What it does |
-|---------|--------------|
-| `tradeos ingest` | refresh prices + fundamentals + sector/news/ownership for the whole universe (holdings ∪ `universe.csv`) + benchmark. Idempotent (UPSERT) — safe to re-run daily. |
-| `tradeos check` | DB row counts + date ranges per ticker (the "data is really there" check) |
-
-### Analysis
-| Command | What it does |
-|---------|--------------|
-| `tradeos risk [--horizon d/w/m/q/y\|N] [--as-of YYYY-MM-DD] [--no-llm]` | portfolio risk: EWMA vol, beta, VaR/CVaR (historical + FHS), component risk %, liquidity, limit checks |
-| `tradeos analyze [--horizon …] [--as-of …] [--no-llm] [--no-snapshot]` | the multi-agent per-stock cards (6 dims + attention + confidence + what-changed delta). `--no-snapshot` skips storing/diffing the run. |
-| `tradeos briefing [--horizon …] [--as-of …]` | pre-market summary + alerts on your rules (top risk contributor, downtrend near lows, earnings declining, margins contracting, negative news, changed-since-last) |
-
-`--as-of` is the point-in-time hook: every read is filtered to `date <= as_of` (no look-ahead).
-`--horizon` accepts `d/w/m/q/y`, aliases (`weekly`, `annual`, …), or `N`/`Nd` trading days.
-
-### Documents & RAG (concall / results PDFs)
-| Command | What it does |
-|---------|--------------|
-| `tradeos docs add SYMBOL FILE [--period YYYY-MM-DD] [--filing-date YYYY-MM-DD] [--url URL]` | parse → chunk → embed (local, no key) → store in pgvector. `--period` enables freshness checks. |
-| `tradeos docs list [SYMBOL]` | list ingested documents |
-| `tradeos docs status [SYMBOL]` | coverage: which holdings are MISSING / STALE / UNTAGGED on transcripts |
-| `tradeos ask SYMBOL "QUESTION"` | RAG answer over that symbol's docs, with citations (needs a key for prose; otherwise shows the retrieved excerpts) |
-| `tradeos extract SYMBOL` | extract structured concall guidance (revenue/margin outlook + quotes) → feeds the Fundamental agent |
-
-### Backtest / eval
-| Command | What it does |
-|---------|--------------|
-| `tradeos eval [--horizon N] [--step N]` | does each signal predict forward returns? Cross-sectional IC, ICIR, Newey-West t, hit-rate, gross + net-of-cost tercile spread, **p-values + Bonferroni** multiple-testing deflation |
-| `tradeos rag-eval [--k N]` | RAG retrieval quality (recall@k / answerable / best-distance) vs a golden set; also scores generation if a key is set |
-
-### Serve the dashboard backend
-| Command | What it does |
-|---------|--------------|
-| `tradeos serve [--host 127.0.0.1] [--port 8000]` | run the FastAPI read API (interactive docs at `/docs`); serves the built SPA if `web/build` exists |
-
-**Script aliases** (same entry points, defined in `pyproject.toml`): `tradeos-ingest`,
-`tradeos-check`, `tradeos-risk`, `tradeos-analyze`, `tradeos-api`. e.g. `uv run tradeos-risk --no-llm`.
-
-### HTTP API (read-only JSON)
-Start with `uv run tradeos serve`, then:
-`GET /api/health` · `/api/holdings` · `/api/portfolio` · `/api/stock/{sym}` ·
-`/api/stock/{sym}/series` · `/api/risk` · `/api/eval` · `/api/briefing` · `/api/docs/status` ·
-`POST /api/ask {symbol, question}`. Most take `?horizon=` and `?as_of=`; `?narrate=true` adds the LLM
-trace (per-stock narration is scoped to just that holding). Factual reads are cached (see knobs below).
+**Research scripts** (not wired into the CLI; reuse the pure engine):
+```bash
+uv run python research/sizing.py          # risk-parity (ERC) position sizing + a cost/turnover guard
+uv run python research/sector_neutral.py  # sector-neutralized + composite signal eval
+```
 
 ---
 
-## 5. The web dashboard (`web/`)
+## 6. The eval, and what it found
 
-SvelteKit (Svelte 5) + TypeScript + Apache ECharts. It only ever talks to the API — never the DB.
+`eval.py` measures, per signal, over a point-in-time history:
+- **Cross-sectional IC** (daily Spearman across names, averaged) — the desk-standard selection metric.
+- **Newey-West (HAC) t-stat** — overlapping forward windows are autocorrelated; this corrects the naive SE.
+- **Net long-short tercile spread** — `|gross| − round-trip cost`, so cost erodes the edge (even a reversion signal).
+- **Multiple-testing deflation** — per-signal p-value + a Bonferroni floor; a lone `|t|>2` across trials is flagged.
+- **Survivorship** flagged (universe = holdings ∪ `universe.csv`); **fundamentals announcement-lagged** (no look-ahead).
+
+**The honest verdict (106 NSE names × 10y):** no simple signal has bankable edge. Everything that flickered
+on 2 years collapsed to `t≈0` with real power; the only statistically-significant hit (RSI @ 5-day) had a
+**negative** net spread — real, but smaller than costs. Sector-neutralization sharpened the t-stats (it's the
+correct selection-IC method, worth productionizing) but still cleared nothing. **That negative result is the
+point** — it's why this is a sense-making tool, not a forecaster, and why the discipline layer
+(`research/sizing.py`) focuses on risk + cost, where a personal book actually compounds.
+
+---
+
+## 7. The dashboard (`web/`)
+
+SvelteKit (Svelte 5) + TypeScript + Apache ECharts. It only ever talks to the API.
 
 ```bash
-cd web
-npm install
-npm run dev        # dev server on http://localhost:5173 (proxies to the API at :8000)
+cd web && npm install
+npm run dev        # http://localhost:5173 (proxies to the API at :8000)
 npm run check      # svelte-check (keep it clean)
-npm run build      # adapter-static → web/build (then FastAPI serves it at the API origin)
+npm run build      # adapter-static → web/build (then FastAPI serves it)
 ```
-
-Run the backend in another terminal: `uv run tradeos serve` (→ :8000). Override the API base for the
-dev server with `VITE_API_BASE` in `web/.env` (template: `web/.env.example`). Pages: portfolio
-overview (KPI tiles · risk-vs-weight bars · sector donut · correlation heatmap · cards), per-stock
-drill-in (price+SMA chart · gauges · returns · trace · RAG ask), eval table, and briefing.
+Run the backend alongside: `uv run tradeos serve`. Pages: **Overview** (risk-vs-weight, sector donut,
+correlation heatmap, cards) · **Analyst** workbench per symbol (every angle + verdict + **History**) ·
+**Briefs** (`/runs`, the global brief feed) · **Newsroom** · **Reasoning Monitor** (live multi-agent run, SSE)
+· **Briefing** · **Data Coverage** · **Manage** (add holdings, upload concalls).
 
 ---
 
-## 6. Environment variables
+## 8. Environment variables
 
-All optional — sane defaults apply. Set in `.env` (loaded automatically) or the shell.
+All optional — sane defaults apply; set in `.env` or the shell.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `DATABASE_URL` | `postgresql://tradeos:tradeos@localhost:5432/tradeos` | Postgres connection string |
-| `HISTORY_PERIOD` | `2y` | how much daily history to pull (`1y`/`2y`/`5y`/`max`) |
+| `ANTHROPIC_API_KEY` | *(unset)* | AI verdict · credibility · live news · RAG answers |
+| `ANALYST_MODEL` | `claude-haiku-4-5` | the analyst verdict + credibility model (`claude-sonnet-4-6` for precision) |
+| `NEWS_MODEL` | `claude-haiku-4-5` | the live web-search model |
+| `NEWS_TTL_HOURS` | `24` | how long stored news is reused before a fresh search (`6` = intraday, `168` = a week) |
+| `CLAUDE_MODEL` | `claude-opus-4-8` | the `analyze`/narration + guidance-extraction model |
+| `HISTORY_PERIOD` | `2y` | daily price history to pull (`1y`/`2y`/`5y`/`10y`/`max`) |
 | `BENCHMARK` | `^NSEI` | index for beta (NIFTY 50) |
-| `ANTHROPIC_API_KEY` | *(unset)* | enables LLM narration + RAG answers |
-| `CLAUDE_MODEL` | `claude-opus-4-8` | narration model (`claude-sonnet-4-6` / `claude-haiku-4-5` are cheaper) |
-| `COV_SHRINKAGE` | `1` | Ledoit-Wolf covariance shrinkage on/off (`0` to disable) |
+| `COV_SHRINKAGE` | `1` | Ledoit-Wolf covariance shrinkage on/off |
 | `SECTOR_CONCENTRATION_PCT` | `40.0` | macro: flag a sector above this % of the book |
 | `ANNOUNCEMENT_LAG_DAYS` | `45` | days after quarter-end before results are "known" (point-in-time) |
 | `COST_BPS` | `15` | per-leg transaction cost for the eval's net spread |
 | `RAG_MAX_DISTANCE` | `0.45` | cosine-distance floor above which `ask` flags weak evidence |
-| `PORTFOLIO_FILE` | `holdings.csv` | your holdings file |
-| `UNIVERSE_FILE` | `universe.csv` | extra (sold/delisted) names for a survivorship-free eval universe |
+| `PORTFOLIO_FILE` / `UNIVERSE_FILE` | `holdings.csv` / `universe.csv` | your book / the survivorship-free eval universe |
 | `API_HOST` / `API_PORT` | `127.0.0.1` / `8000` | where `tradeos serve` binds |
-| `CORS_ORIGINS` | *(none extra)* | comma-separated extra origins allowed to call the API |
-| `READ_CACHE_TTL` | `300` | seconds the API caches factual reads; `0` disables caching |
-| `DB_POOL_MIN` / `DB_POOL_MAX` / `DB_POOL_TIMEOUT` | `1` / `10` / `5` | connection-pool sizing + acquire timeout (seconds) |
+| `READ_CACHE_TTL` | `300` | seconds the API caches factual reads (`0` disables) |
+| `DB_POOL_MIN` / `DB_POOL_MAX` / `DB_POOL_TIMEOUT` | `1` / `10` / `5` | connection-pool sizing |
 
 ---
 
-## 7. Point-in-time & honesty model (why outputs are trustworthy)
+## 9. Point-in-time & honesty model (why outputs are trustworthy)
 
 - **`--as-of`** filters every read to `date <= as_of`; fundamentals additionally require
-  `period_end + ANNOUNCEMENT_LAG_DAYS <= as_of`, so a replay never sees results before they were public.
-- **`price_vintages`** is an append-only revision log: `eval --vintage_asof` (and `risk.load_panels_asof`)
-  reconstruct prices *as they were known* at a date, so a backtest isn't silently re-stated by a later
-  yfinance re-adjustment.
-- **Survivorship**: the eval universe = holdings ∪ `universe.csv` (add sold/delisted names there).
-- **Honest stats**: overlapping windows use Newey-West HAC t-stats; multiple signals are deflated
-  (Bonferroni); small-universe results are labelled underpowered, not dressed up.
-- **Provenance**: the risk read surfaces `cov_obs`/`var_obs` (the common-sample length behind the
-  covariance and VaR) and `data_warnings` when a short-history holding truncates the sample; horizon
-  VaR is labelled a √T (iid) approximation while the 1-day VaR limit check stays exact.
+  `period_end + ANNOUNCEMENT_LAG_DAYS <= as_of`. **Live web news is disabled for a historical `as_of`** —
+  fetching today's news for a past date would be look-ahead.
+- **`price_vintages`** is an append-only revision log: a replay reconstructs prices *as they were known* at
+  a date, so a backtest isn't silently re-stated by a later yfinance re-adjustment.
+- **Honest stats**: Newey-West HAC t-stats for overlapping windows; Bonferroni deflation; small universes
+  labelled underpowered, not dressed up.
+- **Provenance**: every output carries `as_of` + the features behind it; RAG answers cite chunks and flag
+  weak retrieval; credibility cites the actual numbers and refuses to score vague guidance.
 
 ---
 
-## 8. Performance
-
-- **Connection pool** (`db.py`, `psycopg_pool`) reuses connections across the ~6 reads each
-  `analyze` makes — tune with `DB_POOL_*`.
-- **Read-layer cache** (`cache.py`) memoises the factual analysis/risk/eval per `(as_of, horizon)` for
-  `READ_CACHE_TTL` seconds and hands back deep copies; the portfolio and every per-stock page share one
-  computation. After an ingest, restart the server (or wait out the TTL) to pick up fresh prices.
-- The per-stock endpoint narrates **only the requested holding**, not the whole book.
-
----
-
-## 9. Development
+## 10. Development
 
 ```bash
-uv run pytest -q                 # 117 tests; DB-backed integration tests skip cleanly without Postgres
+uv run pytest -q                 # 132 tests; DB-backed integration tests skip cleanly without Postgres
 uv run ruff check .              # lint (must stay clean)
 uv run mypy src/tradeos          # type-check (must stay clean)
+cd web && npm run check          # svelte-check (must stay clean)
 ```
 
-CI (`.github/workflows/ci.yml`) runs all three on every push/PR. Definition of done: Prime Directives
-intact, quant core pure, mypy+ruff clean, pytest green, a point-in-time invariant test for any new
-analyzer, repo map updated. See `CLAUDE.md` for the full contributor contract and `ROADMAP.md` for phases.
+CI runs all three on every push/PR. See `CLAUDE.md` for the contributor contract and `ROADMAP.md` for phases.
 
 ---
 
-## 10. Security notes
+## 11. Security notes
 
 - The API has **no auth** and binds to `127.0.0.1` by default — keep it local. Do **not** set
-  `API_HOST=0.0.0.0` on an untrusted network: `/api/holdings` exposes your book and `?narrate=true` /
-  `/api/ask` spend Claude tokens.
-- Keep `holdings.csv` (and `data/`) out of version control — they hold your real positions and private
-  documents (both are git-ignored).
+  `API_HOST=0.0.0.0` on an untrusted network: it exposes your book and the write/LLM/web-search routes spend money.
+- Keep `holdings.csv` (and `data/`) out of version control — they hold your real positions and private documents.
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
-- **`No price data found. Run tradeos ingest first.`** → run `uv run tradeos ingest`.
-- **`connection refused` / pool timeout** → Postgres isn't up. `brew services list` (or `docker compose ps`); check `DATABASE_URL`.
-- **`no data returned` for a ticker** → wrong symbol/suffix. NSE needs `.NS`, BSE `.BO`.
-- **RAG / `ask` errors about the `vector` type** → pgvector isn't installed/enabled; re-run `psql -d tradeos -f db/init/01_init.sql` on a Postgres that has pgvector.
-- **LLM steps do nothing** → `ANTHROPIC_API_KEY` isn't set; that's expected — the numbers still print.
-- **Dashboard can't reach the API** → start `uv run tradeos serve` and/or set `VITE_API_BASE` in `web/.env`.
+- **`No price data found. Run tradeos ingest first.`** → `uv run tradeos ingest`.
+- **`connection refused` / pool timeout** → Postgres isn't up. `brew services list`; check `DATABASE_URL`.
+- **`no data` for a ticker** → wrong symbol/suffix. NSE needs `.NS`, BSE `.BO`.
+- **AI verdict / live news does nothing** → `ANTHROPIC_API_KEY` not set (the deterministic detail still prints).
+- **Credibility says "no guidance"** → ingest a **concall transcript** (not a results filing) and `tradeos extract`.
+- **A brief mis-states a number** → Haiku tradeoff; re-run with `ANALYST_MODEL=claude-sonnet-4-6`.
+- **RAG / `ask` errors about the `vector` type** → pgvector isn't enabled; re-run `psql -d tradeos -f db/init/01_init.sql`.

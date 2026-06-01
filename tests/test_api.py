@@ -57,6 +57,103 @@ def test_stock_series_rejects_bad_lookback():
     assert client.get("/api/stock/INFY.NS/series?lookback=5").status_code == 422   # below ge=30
 
 
+# --------------------------- evidence layer (Analyst Workbench / Newsroom / Coverage) ---------------------------
+
+def test_sanitize_coerces_numpy_dates_and_models():
+    """The evidence endpoints lean on _sanitize to JSON-ify np scalars, dates and Pydantic models."""
+    import datetime as dt
+    import json
+
+    import numpy as np
+    from pydantic import BaseModel
+
+    from tradeos.api import _sanitize
+
+    class M(BaseModel):
+        a: int
+
+    out = _sanitize({"f": np.float64(1.5), "i": np.int64(3), "d": dt.date(2026, 1, 2),
+                     "m": M(a=7), "xs": [np.float32(2.0), None, "x"]})
+    assert out == {"f": 1.5, "i": 3, "d": "2026-01-02", "m": {"a": 7}, "xs": [2.0, None, "x"]}
+    json.dumps(out)                                          # must be JSON-serialisable end to end
+
+
+def test_analyst_endpoint_shape_or_404():
+    r = client.get("/api/analyst/INFY.NS?verdict=false")
+    assert r.status_code in (200, 404, 503)
+    if r.status_code == 200:
+        body = r.json()
+        assert {"symbol", "as_of", "facts", "verdict", "usage"} <= set(body)
+        assert body["verdict"] is None                       # verdict=false ⇒ no LLM call
+        assert isinstance(body["facts"], dict) and body["facts"]["symbol"] == "INFY.NS"
+
+
+def test_analyst_unknown_symbol_404():
+    r = client.get("/api/analyst/NOTREAL.NS?verdict=false")
+    assert r.status_code in (404, 503)                       # SystemExit-no-data mapped to a clean 404
+
+
+def test_analyst_deep_shape_or_404():
+    """The deep read endpoint returns the multi-agent shape (deep=None without a key) or degrades."""
+    r = client.get("/api/analyst/INFY.NS/deep")
+    assert r.status_code in (200, 404, 503)
+    if r.status_code == 200:
+        body = r.json()
+        assert {"symbol", "as_of", "facts", "deep", "debate", "usage", "cost_usd", "model"} <= set(body)
+        assert body["symbol"] == "INFY.NS"
+
+
+def test_analyst_ask_shape_or_503():
+    """Ask-the-analyst is distinct from /api/ask; web=False keeps it offline. No key ⇒ excerpts + note."""
+    r = client.post("/api/analyst/ask",
+                    json={"symbol": "INFY.NS", "question": "how are margins trending?", "web": False})
+    assert r.status_code in (200, 404, 503)
+    if r.status_code == 200:
+        body = r.json()
+        assert {"answer", "citations", "hits", "web_used", "web_sources", "note"} <= set(body)
+        assert body["web_used"] is False                     # web disabled in the request
+
+
+def test_stock_news_shape_or_503():
+    r = client.get("/api/stock/INFY.NS/news?limit=5")
+    assert r.status_code in (200, 503)
+    if r.status_code == 200:
+        body = r.json()
+        assert body["symbol"] == "INFY.NS" and isinstance(body["headlines"], list)
+        for h in body["headlines"]:
+            assert {"title", "publisher", "published", "polarity", "event"} <= set(h)
+
+
+def test_stock_news_rejects_bad_limit():
+    assert client.get("/api/stock/INFY.NS/news?limit=0").status_code == 422   # below ge=1
+
+
+def test_stock_docs_shape_or_503():
+    r = client.get("/api/stock/INFY.NS/docs")
+    assert r.status_code in (200, 503)
+    if r.status_code == 200:
+        assert r.json()["symbol"] == "INFY.NS" and isinstance(r.json()["documents"], list)
+
+
+def test_news_feed_shape_or_503():
+    r = client.get("/api/news?limit=10")
+    assert r.status_code in (200, 503)
+    if r.status_code == 200:
+        body = r.json()
+        assert "headlines" in body and isinstance(body["headlines"], list)
+        assert len(body["headlines"]) <= 10                  # limit honoured
+
+
+def test_coverage_shape_or_503():
+    r = client.get("/api/coverage")
+    assert r.status_code in (200, 503)
+    if r.status_code == 200:
+        rows = r.json()["rows"]
+        assert isinstance(rows, list)
+        for row in rows:
+            assert {"symbol", "price_rows", "news", "doc_chunks"} <= set(row)
+
+
 # --------------------------- write seam (mutations) ---------------------------
 # These call the same config/docs functions the CLI uses. Holdings tests point PORTFOLIO_FILE at a
 # temp file so the real holdings.csv is never touched, and use fetch=False so there's no network.
